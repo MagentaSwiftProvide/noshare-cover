@@ -22,13 +22,15 @@ extern "C" {
 #include <filesystem>
 #include <pwd.h>
 #include <unistd.h>
-#include <fstream>
 #include <functional>
 #include <iomanip>
 #include <memory>
 #include <optional>
+#include <regex>
 #include <sstream>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #define private public
@@ -38,16 +40,14 @@ extern "C" {
 #include "desktop/state/WindowState.hpp"
 #include "desktop/view/Window.hpp"
 #include "managers/fullscreen/FullscreenController.hpp"
+#include "config/values/ConfigValues.hpp"
 #include "plugins/PluginAPI.hpp"
 #include "render/pass/TexPassElement.hpp"
 
-static HANDLE              PHANDLE = nullptr;
-static CFunctionHook*       g_hook  = nullptr;
-static SP<Render::ITexture> g_cover;
+static HANDLE        PHANDLE = nullptr;
+static CFunctionHook* g_hook  = nullptr;
 
 enum class eKind { None, Still, Gif, Video };
-static eKind g_kind = eKind::None;
-static bool g_missing = false;
 static std::string g_error;
 
 static void notifyOnce(const std::string& msg) {
@@ -57,13 +57,25 @@ static void notifyOnce(const std::string& msg) {
     HyprlandAPI::addNotification(PHANDLE, msg, CHyprColor{1.F, 0.2F, 0.2F, 1.F}, 4000);
 }
 
+struct SRule {
+    bool        title = false;
+    std::regex  re;
+    std::string path;
+};
+
 struct SConf {
-    std::string file;
-    bool        loop  = true;
-    double      speed = 1.0;
-    bool        ready = false;
-    std::filesystem::file_time_type mtime{};
+    std::string        file;
+    std::string        rulesRaw;
+    std::vector<SRule> rules;
+    bool               loop  = true;
+    double             speed = 1.0;
+    bool               ready = false;
 } g_conf;
+
+static SP<Config::Values::CStringValue> g_cfgFile;
+static SP<Config::Values::CBoolValue>   g_cfgLoop;
+static SP<Config::Values::CFloatValue>  g_cfgSpeed;
+static SP<Config::Values::CStringValue> g_cfgRules;
 
 struct SVideo {
     AVFormatContext* fmt    = nullptr;
@@ -76,7 +88,7 @@ struct SVideo {
     int64_t          lastUs     = -1;
     int64_t          t0         = 0;
     bool             draining   = false;
-} g_vid;
+};
 
 struct SGifFrame {
     int delayMs     = 100;
@@ -96,7 +108,19 @@ struct SGif {
     std::vector<uint32_t> canvas;
     std::vector<uint32_t> backup;
     std::vector<SGifFrame> frames;
-} g_gif;
+};
+
+struct SCover {
+    eKind                kind = eKind::None;
+    SP<Render::ITexture> tex;
+    SGif                 gif;
+    SVideo               vid;
+    bool                 missing = false;
+    std::string          error;
+};
+
+static SCover*                                                      active = nullptr;
+static std::unordered_map<std::string, std::unique_ptr<SCover>> g_media;
 
 static std::string homeDir() {
     if (const char* home = std::getenv("HOME"); home && *home)
@@ -108,15 +132,6 @@ static std::string homeDir() {
 
 static std::string configFile(const char* name) {
     return homeDir() + "/.config/hypr/" + name;
-}
-
-static std::string trim(std::string s) {
-    const auto notSpace = [](unsigned char c) { return !std::isspace(c); };
-    s.erase(s.begin(), std::find_if(s.begin(), s.end(), notSpace));
-    s.erase(std::find_if(s.rbegin(), s.rend(), notSpace).base(), s.end());
-    if (s.size() >= 2 && ((s.front() == '"' && s.back() == '"') || (s.front() == '\'' && s.back() == '\'')))
-        s = s.substr(1, s.size() - 2);
-    return s;
 }
 
 static std::string lower(std::string s) {
@@ -166,116 +181,116 @@ static int extensionValue(const SavedImage& image, int* transparent) {
 static void clearRect(int left, int top, int width, int height, uint32_t color) {
     const int x0 = std::max(left, 0);
     const int y0 = std::max(top, 0);
-    const int x1 = std::min(left + width, g_gif.w);
-    const int y1 = std::min(top + height, g_gif.h);
+    const int x1 = std::min(left + width, active->gif.w);
+    const int y1 = std::min(top + height, active->gif.h);
     for (int y = y0; y < y1; ++y) {
-        auto* row = g_gif.canvas.data() + y * g_gif.w;
+        auto* row = active->gif.canvas.data() + y * active->gif.w;
         std::fill(row + x0, row + x1, color);
     }
 }
 
 static void blitGifFrame(int index) {
-    const auto& frame = g_gif.frames[index];
-    const auto& image = g_gif.file->SavedImages[index];
-    const auto* map   = image.ImageDesc.ColorMap ? image.ImageDesc.ColorMap : g_gif.file->SColorMap;
+    const auto& frame = active->gif.frames[index];
+    const auto& image = active->gif.file->SavedImages[index];
+    const auto* map   = image.ImageDesc.ColorMap ? image.ImageDesc.ColorMap : active->gif.file->SColorMap;
     if (!map || !image.RasterBits || frame.width <= 0 || frame.height <= 0)
         return;
 
     for (int y = 0; y < frame.height; ++y) {
         const int dy = frame.top + y;
-        if (dy < 0 || dy >= g_gif.h)
+        if (dy < 0 || dy >= active->gif.h)
             continue;
         for (int x = 0; x < frame.width; ++x) {
             const int dx = frame.left + x;
-            if (dx < 0 || dx >= g_gif.w)
+            if (dx < 0 || dx >= active->gif.w)
                 continue;
             const int px = image.RasterBits[y * frame.width + x];
             if (px == frame.transparent || px >= map->ColorCount)
                 continue;
             const auto& c = map->Colors[px];
-            g_gif.canvas[dy * g_gif.w + dx] = packPixel(c.Red, c.Green, c.Blue, 255);
+            active->gif.canvas[dy * active->gif.w + dx] = packPixel(c.Red, c.Green, c.Blue, 255);
         }
     }
 }
 
 static void applyDisposal(int index) {
-    const auto& frame = g_gif.frames[index];
+    const auto& frame = active->gif.frames[index];
     if (frame.disposal == 2)
-        clearRect(frame.left, frame.top, frame.width, frame.height, g_gif.bg);
-    else if (frame.disposal == 3 && g_gif.backup.size() == g_gif.canvas.size())
-        g_gif.canvas = g_gif.backup;
+        clearRect(frame.left, frame.top, frame.width, frame.height, active->gif.bg);
+    else if (frame.disposal == 3 && active->gif.backup.size() == active->gif.canvas.size())
+        active->gif.canvas = active->gif.backup;
 }
 
 static void stepGif() {
-    const int count = static_cast<int>(g_gif.frames.size());
-    const int next  = g_gif.index + 1;
+    const int count = static_cast<int>(active->gif.frames.size());
+    const int next  = active->gif.index + 1;
     if (next < 0 || next >= count)
         return;
-    if (g_gif.index >= 0)
-        applyDisposal(g_gif.index);
-    if (g_gif.frames[next].disposal == 3)
-        g_gif.backup = g_gif.canvas;
+    if (active->gif.index >= 0)
+        applyDisposal(active->gif.index);
+    if (active->gif.frames[next].disposal == 3)
+        active->gif.backup = active->gif.canvas;
     blitGifFrame(next);
-    g_gif.index = next;
+    active->gif.index = next;
 }
 
 static void uploadCover() {
-    if (!g_pHyprRenderer || g_gif.canvas.empty())
+    if (!g_pHyprRenderer || active->gif.canvas.empty())
         return;
 
-    if (!g_cover || !g_cover->m_texID || g_cover->m_size.x != g_gif.w || g_cover->m_size.y != g_gif.h) {
-        auto* surf = cairo_image_surface_create_for_data(reinterpret_cast<unsigned char*>(g_gif.canvas.data()), CAIRO_FORMAT_ARGB32, g_gif.w, g_gif.h, g_gif.w * 4);
+    if (!active->tex || !active->tex->m_texID || active->tex->m_size.x != active->gif.w || active->tex->m_size.y != active->gif.h) {
+        auto* surf = cairo_image_surface_create_for_data(reinterpret_cast<unsigned char*>(active->gif.canvas.data()), CAIRO_FORMAT_ARGB32, active->gif.w, active->gif.h, active->gif.w * 4);
         if (!surf || cairo_surface_status(surf) != CAIRO_STATUS_SUCCESS) {
             if (surf)
                 cairo_surface_destroy(surf);
             return;
         }
-        g_cover = g_pHyprRenderer->createTexture(surf);
+        active->tex = g_pHyprRenderer->createTexture(surf);
         cairo_surface_destroy(surf);
         return;
     }
 
-    const CRegion damage{0.0, 0.0, static_cast<double>(g_gif.w), static_cast<double>(g_gif.h)};
-    g_cover->update(DRM_FORMAT_ARGB8888, reinterpret_cast<uint8_t*>(g_gif.canvas.data()), static_cast<uint32_t>(g_gif.w * 4), damage);
+    const CRegion damage{0.0, 0.0, static_cast<double>(active->gif.w), static_cast<double>(active->gif.h)};
+    active->tex->update(DRM_FORMAT_ARGB8888, reinterpret_cast<uint8_t*>(active->gif.canvas.data()), static_cast<uint32_t>(active->gif.w * 4), damage);
 }
 
 static int frameAt(int64_t pos) {
     int64_t acc = 0;
-    for (int i = 0; i < static_cast<int>(g_gif.frames.size()); ++i) {
-        acc += g_gif.frames[i].delayMs;
+    for (int i = 0; i < static_cast<int>(active->gif.frames.size()); ++i) {
+        acc += active->gif.frames[i].delayMs;
         if (pos < acc)
             return i;
     }
-    return static_cast<int>(g_gif.frames.size()) - 1;
+    return static_cast<int>(active->gif.frames.size()) - 1;
 }
 
 static void showGifFrame(int target) {
-    if (target == g_gif.index)
+    if (target == active->gif.index)
         return;
-    if (target < g_gif.index) {
-        std::fill(g_gif.canvas.begin(), g_gif.canvas.end(), g_gif.bg);
-        g_gif.index = -1;
+    if (target < active->gif.index) {
+        std::fill(active->gif.canvas.begin(), active->gif.canvas.end(), active->gif.bg);
+        active->gif.index = -1;
     }
     int guard = 0;
-    while (g_gif.index != target && guard++ < static_cast<int>(g_gif.frames.size()) + 2)
+    while (active->gif.index != target && guard++ < static_cast<int>(active->gif.frames.size()) + 2)
         stepGif();
     uploadCover();
 }
 
 static void syncGif() {
-    if (!g_gif.file || g_gif.frames.empty() || g_gif.totalMs < 1)
+    if (!active->gif.file || active->gif.frames.empty() || active->gif.totalMs < 1)
         return;
     const auto now = nowMs();
-    if (g_gif.t0 == 0)
-        g_gif.t0 = now;
+    if (active->gif.t0 == 0)
+        active->gif.t0 = now;
     const double speed = g_conf.speed > 0.0 ? g_conf.speed : 1.0;
-    auto         elapsed = static_cast<int64_t>((now - g_gif.t0) * speed);
+    auto         elapsed = static_cast<int64_t>((now - active->gif.t0) * speed);
     if (elapsed < 0)
         elapsed = 0;
     if (!g_conf.loop)
-        elapsed = std::min(elapsed, g_gif.totalMs - 1);
+        elapsed = std::min(elapsed, active->gif.totalMs - 1);
     else
-        elapsed %= g_gif.totalMs;
+        elapsed %= active->gif.totalMs;
     showGifFrame(frameAt(elapsed));
 }
 
@@ -288,23 +303,23 @@ static bool loadGif(const std::string& path) {
         return false;
     }
 
-    g_gif.file = file;
-    g_gif.w    = file->SWidth;
-    g_gif.h    = file->SHeight;
-    g_gif.canvas.assign(static_cast<size_t>(g_gif.w) * g_gif.h, 0);
-    g_gif.frames.resize(file->ImageCount);
+    active->gif.file = file;
+    active->gif.w    = file->SWidth;
+    active->gif.h    = file->SHeight;
+    active->gif.canvas.assign(static_cast<size_t>(active->gif.w) * active->gif.h, 0);
+    active->gif.frames.resize(file->ImageCount);
 
     if (file->SColorMap && file->SBackGroundColor >= 0 && file->SBackGroundColor < file->SColorMap->ColorCount) {
         const auto& c = file->SColorMap->Colors[file->SBackGroundColor];
-        g_gif.bg      = packPixel(c.Red, c.Green, c.Blue, 255);
+        active->gif.bg      = packPixel(c.Red, c.Green, c.Blue, 255);
     }
-    std::fill(g_gif.canvas.begin(), g_gif.canvas.end(), g_gif.bg);
+    std::fill(active->gif.canvas.begin(), active->gif.canvas.end(), active->gif.bg);
 
     for (int i = 0; i < file->ImageCount; ++i) {
         const auto& image = file->SavedImages[i];
         int         transparent = -1;
         const int   packed      = extensionValue(image, &transparent);
-        auto&       frame       = g_gif.frames[i];
+        auto&       frame       = active->gif.frames[i];
         frame.delayMs           = packed & 0xffff;
         frame.disposal          = (packed >> 16) & 0x7;
         frame.transparent       = transparent;
@@ -312,12 +327,12 @@ static bool loadGif(const std::string& path) {
         frame.top               = image.ImageDesc.Top;
         frame.width             = image.ImageDesc.Width;
         frame.height            = image.ImageDesc.Height;
-        g_gif.totalMs += frame.delayMs;
+        active->gif.totalMs += frame.delayMs;
     }
 
     showGifFrame(0);
-    g_kind = eKind::Gif;
-    return g_cover && g_cover->ok() && g_cover->m_texID;
+    active->kind = eKind::Gif;
+    return active->tex && active->tex->ok() && active->tex->m_texID;
 }
 
 static bool loadPng(const std::string& path) {
@@ -328,10 +343,10 @@ static bool loadPng(const std::string& path) {
         return false;
     }
 
-    g_cover = g_pHyprRenderer->createTexture(surf);
+    active->tex = g_pHyprRenderer->createTexture(surf);
     cairo_surface_destroy(surf);
-    g_kind  = eKind::Still;
-    return g_cover && g_cover->ok() && g_cover->m_texID;
+    active->kind  = eKind::Still;
+    return active->tex && active->tex->ok() && active->tex->m_texID;
 }
 
 struct SJpegErr {
@@ -364,164 +379,164 @@ static bool loadJpeg(const std::string& path) {
     cinfo.out_color_space = JCS_RGB;
     jpeg_start_decompress(&cinfo);
 
-    g_gif.w = static_cast<int>(cinfo.output_width);
-    g_gif.h = static_cast<int>(cinfo.output_height);
-    if (g_gif.w < 1 || g_gif.h < 1) {
+    active->gif.w = static_cast<int>(cinfo.output_width);
+    active->gif.h = static_cast<int>(cinfo.output_height);
+    if (active->gif.w < 1 || active->gif.h < 1) {
         jpeg_destroy_decompress(&cinfo);
         std::fclose(file);
         return false;
     }
 
-    g_gif.canvas.assign(static_cast<size_t>(g_gif.w) * g_gif.h, 0);
-    std::vector<uint8_t> row(static_cast<size_t>(g_gif.w) * 3);
+    active->gif.canvas.assign(static_cast<size_t>(active->gif.w) * active->gif.h, 0);
+    std::vector<uint8_t> row(static_cast<size_t>(active->gif.w) * 3);
     while (cinfo.output_scanline < cinfo.output_height) {
         uint8_t* scan = row.data();
         jpeg_read_scanlines(&cinfo, &scan, 1);
         const int y = static_cast<int>(cinfo.output_scanline) - 1;
-        for (int x = 0; x < g_gif.w; ++x)
-            g_gif.canvas[y * g_gif.w + x] = packPixel(row[x * 3], row[x * 3 + 1], row[x * 3 + 2], 255);
+        for (int x = 0; x < active->gif.w; ++x)
+            active->gif.canvas[y * active->gif.w + x] = packPixel(row[x * 3], row[x * 3 + 1], row[x * 3 + 2], 255);
     }
 
     jpeg_finish_decompress(&cinfo);
     jpeg_destroy_decompress(&cinfo);
     std::fclose(file);
     uploadCover();
-    g_kind = eKind::Still;
-    return g_cover && g_cover->ok() && g_cover->m_texID;
+    active->kind = eKind::Still;
+    return active->tex && active->tex->ok() && active->tex->m_texID;
 }
 
 static void closeVideo() {
-    if (g_vid.pkt)
-        av_packet_free(&g_vid.pkt);
-    if (g_vid.frame)
-        av_frame_free(&g_vid.frame);
-    if (g_vid.sws)
-        sws_freeContext(g_vid.sws);
-    if (g_vid.dec)
-        avcodec_free_context(&g_vid.dec);
-    if (g_vid.fmt)
-        avformat_close_input(&g_vid.fmt);
-    g_vid = {};
+    if (active->vid.pkt)
+        av_packet_free(&active->vid.pkt);
+    if (active->vid.frame)
+        av_frame_free(&active->vid.frame);
+    if (active->vid.sws)
+        sws_freeContext(active->vid.sws);
+    if (active->vid.dec)
+        avcodec_free_context(&active->vid.dec);
+    if (active->vid.fmt)
+        avformat_close_input(&active->vid.fmt);
+    active->vid = {};
 }
 
 static bool presentVideoFrame() {
-    if (!g_vid.frame || g_vid.frame->width < 1 || g_vid.frame->height < 1)
+    if (!active->vid.frame || active->vid.frame->width < 1 || active->vid.frame->height < 1)
         return false;
 
-    g_vid.sws = sws_getCachedContext(g_vid.sws, g_vid.frame->width, g_vid.frame->height, static_cast<AVPixelFormat>(g_vid.frame->format), g_gif.w, g_gif.h, AV_PIX_FMT_BGRA,
+    active->vid.sws = sws_getCachedContext(active->vid.sws, active->vid.frame->width, active->vid.frame->height, static_cast<AVPixelFormat>(active->vid.frame->format), active->gif.w, active->gif.h, AV_PIX_FMT_BGRA,
                                      SWS_BILINEAR, nullptr, nullptr, nullptr);
-    if (!g_vid.sws)
+    if (!active->vid.sws)
         return false;
 
-    uint8_t* dstData[4]  = {reinterpret_cast<uint8_t*>(g_gif.canvas.data()), nullptr, nullptr, nullptr};
-    int      dstStride[4] = {g_gif.w * 4, 0, 0, 0};
-    sws_scale(g_vid.sws, g_vid.frame->data, g_vid.frame->linesize, 0, g_vid.frame->height, dstData, dstStride);
+    uint8_t* dstData[4]  = {reinterpret_cast<uint8_t*>(active->gif.canvas.data()), nullptr, nullptr, nullptr};
+    int      dstStride[4] = {active->gif.w * 4, 0, 0, 0};
+    sws_scale(active->vid.sws, active->vid.frame->data, active->vid.frame->linesize, 0, active->vid.frame->height, dstData, dstStride);
     uploadCover();
-    return g_cover && g_cover->ok() && g_cover->m_texID;
+    return active->tex && active->tex->ok() && active->tex->m_texID;
 }
 
 static bool pullVideoFrame() {
-    auto* st = g_vid.fmt->streams[g_vid.stream];
+    auto* st = active->vid.fmt->streams[active->vid.stream];
     for (int spins = 0; spins < 256; ++spins) {
-        const int got = avcodec_receive_frame(g_vid.dec, g_vid.frame);
+        const int got = avcodec_receive_frame(active->vid.dec, active->vid.frame);
         if (got == 0) {
-            const int64_t pts = g_vid.frame->best_effort_timestamp != AV_NOPTS_VALUE ? g_vid.frame->best_effort_timestamp : g_vid.frame->pts;
-            g_vid.lastUs      = pts == AV_NOPTS_VALUE ? g_vid.lastUs + 1 : av_rescale_q(pts, st->time_base, AV_TIME_BASE_Q);
+            const int64_t pts = active->vid.frame->best_effort_timestamp != AV_NOPTS_VALUE ? active->vid.frame->best_effort_timestamp : active->vid.frame->pts;
+            active->vid.lastUs      = pts == AV_NOPTS_VALUE ? active->vid.lastUs + 1 : av_rescale_q(pts, st->time_base, AV_TIME_BASE_Q);
             return true;
         }
         if (got != AVERROR(EAGAIN) && got != AVERROR_EOF)
             return false;
 
-        if (g_vid.draining)
+        if (active->vid.draining)
             return false;
 
-        if (av_read_frame(g_vid.fmt, g_vid.pkt) < 0) {
-            avcodec_send_packet(g_vid.dec, nullptr);
-            g_vid.draining = true;
+        if (av_read_frame(active->vid.fmt, active->vid.pkt) < 0) {
+            avcodec_send_packet(active->vid.dec, nullptr);
+            active->vid.draining = true;
             continue;
         }
-        if (g_vid.pkt->stream_index == g_vid.stream)
-            avcodec_send_packet(g_vid.dec, g_vid.pkt);
-        av_packet_unref(g_vid.pkt);
+        if (active->vid.pkt->stream_index == active->vid.stream)
+            avcodec_send_packet(active->vid.dec, active->vid.pkt);
+        av_packet_unref(active->vid.pkt);
     }
     return false;
 }
 
 static void seekVideo(int64_t elapsedUs) {
-    auto* st = g_vid.fmt->streams[g_vid.stream];
+    auto* st = active->vid.fmt->streams[active->vid.stream];
     const auto pts = av_rescale_q(elapsedUs, AV_TIME_BASE_Q, st->time_base);
-    av_seek_frame(g_vid.fmt, g_vid.stream, std::max<int64_t>(pts, 0), AVSEEK_FLAG_BACKWARD);
-    avcodec_flush_buffers(g_vid.dec);
-    g_vid.lastUs   = -1;
-    g_vid.draining = false;
+    av_seek_frame(active->vid.fmt, active->vid.stream, std::max<int64_t>(pts, 0), AVSEEK_FLAG_BACKWARD);
+    avcodec_flush_buffers(active->vid.dec);
+    active->vid.lastUs   = -1;
+    active->vid.draining = false;
 }
 
 static bool loadVideo(const std::string& path) {
     closeVideo();
-    if (avformat_open_input(&g_vid.fmt, path.c_str(), nullptr, nullptr) < 0)
+    if (avformat_open_input(&active->vid.fmt, path.c_str(), nullptr, nullptr) < 0)
         return false;
-    if (avformat_find_stream_info(g_vid.fmt, nullptr) < 0)
+    if (avformat_find_stream_info(active->vid.fmt, nullptr) < 0)
         return false;
 
     const AVCodec* codec = nullptr;
-    g_vid.stream         = av_find_best_stream(g_vid.fmt, AVMEDIA_TYPE_VIDEO, -1, -1, &codec, 0);
-    if (g_vid.stream < 0 || !codec)
+    active->vid.stream         = av_find_best_stream(active->vid.fmt, AVMEDIA_TYPE_VIDEO, -1, -1, &codec, 0);
+    if (active->vid.stream < 0 || !codec)
         return false;
 
-    g_vid.dec = avcodec_alloc_context3(codec);
-    if (!g_vid.dec || avcodec_parameters_to_context(g_vid.dec, g_vid.fmt->streams[g_vid.stream]->codecpar) < 0 || avcodec_open2(g_vid.dec, codec, nullptr) < 0)
+    active->vid.dec = avcodec_alloc_context3(codec);
+    if (!active->vid.dec || avcodec_parameters_to_context(active->vid.dec, active->vid.fmt->streams[active->vid.stream]->codecpar) < 0 || avcodec_open2(active->vid.dec, codec, nullptr) < 0)
         return false;
 
-    g_vid.frame = av_frame_alloc();
-    g_vid.pkt   = av_packet_alloc();
-    g_gif.w     = g_vid.dec->width;
-    g_gif.h     = g_vid.dec->height;
-    if (!g_vid.frame || !g_vid.pkt || g_gif.w < 1 || g_gif.h < 1)
+    active->vid.frame = av_frame_alloc();
+    active->vid.pkt   = av_packet_alloc();
+    active->gif.w     = active->vid.dec->width;
+    active->gif.h     = active->vid.dec->height;
+    if (!active->vid.frame || !active->vid.pkt || active->gif.w < 1 || active->gif.h < 1)
         return false;
 
-    auto* st = g_vid.fmt->streams[g_vid.stream];
+    auto* st = active->vid.fmt->streams[active->vid.stream];
     if (st->duration > 0)
-        g_vid.durationUs = av_rescale_q(st->duration, st->time_base, AV_TIME_BASE_Q);
-    else if (g_vid.fmt->duration > 0)
-        g_vid.durationUs = g_vid.fmt->duration;
+        active->vid.durationUs = av_rescale_q(st->duration, st->time_base, AV_TIME_BASE_Q);
+    else if (active->vid.fmt->duration > 0)
+        active->vid.durationUs = active->vid.fmt->duration;
 
-    g_gif.canvas.assign(static_cast<size_t>(g_gif.w) * g_gif.h, packPixel(0, 0, 0, 255));
+    active->gif.canvas.assign(static_cast<size_t>(active->gif.w) * active->gif.h, packPixel(0, 0, 0, 255));
     if (!pullVideoFrame() || !presentVideoFrame())
         return false;
 
-    g_kind = eKind::Video;
+    active->kind = eKind::Video;
     return true;
 }
 
 static void syncVideo() {
-    if (g_kind != eKind::Video || !g_vid.fmt || g_vid.stream < 0)
+    if (active->kind != eKind::Video || !active->vid.fmt || active->vid.stream < 0)
         return;
 
     const auto now = nowMs();
-    if (g_vid.t0 == 0)
-        g_vid.t0 = now;
+    if (active->vid.t0 == 0)
+        active->vid.t0 = now;
 
     const double speed = g_conf.speed > 0.0 ? g_conf.speed : 1.0;
-    int64_t      elapsedUs = static_cast<int64_t>((now - g_vid.t0) * speed * 1000.0);
+    int64_t      elapsedUs = static_cast<int64_t>((now - active->vid.t0) * speed * 1000.0);
     if (elapsedUs < 0)
         elapsedUs = 0;
-    if (g_vid.durationUs > 0) {
+    if (active->vid.durationUs > 0) {
         if (g_conf.loop)
-            elapsedUs %= g_vid.durationUs;
+            elapsedUs %= active->vid.durationUs;
         else
-            elapsedUs = std::min(elapsedUs, g_vid.durationUs);
+            elapsedUs = std::min(elapsedUs, active->vid.durationUs);
     }
 
-    if (g_vid.lastUs < 0 || elapsedUs + 50000 < g_vid.lastUs)
+    if (active->vid.lastUs < 0 || elapsedUs + 50000 < active->vid.lastUs)
         seekVideo(elapsedUs);
 
     bool presented = false;
     int  guard     = 0;
-    while (g_vid.lastUs < elapsedUs && guard++ < 48) {
+    while (active->vid.lastUs < elapsedUs && guard++ < 48) {
         if (!pullVideoFrame()) {
-            if (g_conf.loop && g_vid.durationUs > 0) {
+            if (g_conf.loop && active->vid.durationUs > 0) {
                 seekVideo(0);
-                g_vid.t0 = now;
+                active->vid.t0 = now;
             }
             break;
         }
@@ -532,22 +547,22 @@ static void syncVideo() {
 }
 
 static void closeGif() {
-    if (!g_gif.file)
+    if (!active->gif.file)
         return;
     int err = 0;
-    DGifCloseFile(g_gif.file, &err);
-    g_gif.file = nullptr;
-    g_gif.frames.clear();
-    g_gif.index   = -1;
-    g_gif.totalMs = 0;
-    g_gif.t0      = 0;
+    DGifCloseFile(active->gif.file, &err);
+    active->gif.file = nullptr;
+    active->gif.frames.clear();
+    active->gif.index   = -1;
+    active->gif.totalMs = 0;
+    active->gif.t0      = 0;
 }
 
 static void unloadMedia() {
     closeGif();
     closeVideo();
-    g_gif.canvas.clear();
-    g_kind = eKind::None;
+    active->gif.canvas.clear();
+    active->kind = eKind::None;
 }
 
 static std::string defaultMediaPath() {
@@ -558,63 +573,81 @@ static std::string defaultMediaPath() {
     return "~/.config/hypr/noshare-cover.gif";
 }
 
-static void writeDefaultConfig() {
-    const auto path = configFile("noshare-cover.conf");
-    if (std::filesystem::exists(path))
-        return;
-    std::ofstream out(path);
-    out << "# noshare-cover. Меняешь file и перезагружаешь плагин, либо просто сохраняешь файл: подхватится само.\n"
-        << "file = " << defaultMediaPath() << "\n"
-        << "loop = true\n"
-        << "speed = 1.0\n";
+static std::string trim(std::string s) {
+    const auto notSpace = [](unsigned char c) { return !std::isspace(c); };
+    s.erase(s.begin(), std::find_if(s.begin(), s.end(), notSpace));
+    s.erase(std::find_if(s.rbegin(), s.rend(), notSpace).base(), s.end());
+    return s;
+}
+
+static std::vector<SRule> parseRules(const std::string& text) {
+    std::vector<SRule> out;
+    std::istringstream lines(text);
+    std::string        line;
+    while (std::getline(lines, line)) {
+        const auto hash = line.find('#');
+        if (hash != std::string::npos)
+            line.resize(hash);
+        std::istringstream ls(line);
+        std::string        kind, pattern;
+        if (!(ls >> kind >> pattern))
+            continue;
+        std::string path;
+        std::getline(ls, path);
+        path = trim(path);
+        if (path.empty())
+            continue;
+        const bool title = kind == "title";
+        if (kind != "class" && !title) {
+            notifyOnce("noshare-cover: правило не class и не title");
+            continue;
+        }
+        try {
+            out.push_back(SRule{title, std::regex{pattern}, expandHome(path)});
+        } catch (const std::regex_error&) {
+            notifyOnce("noshare-cover: кривой regex " + pattern);
+        }
+    }
+    return out;
 }
 
 static bool readConfig() {
-    writeDefaultConfig();
-    const auto path = configFile("noshare-cover.conf");
-    std::error_code ec;
-    const auto mtime = std::filesystem::last_write_time(path, ec);
-    if (g_conf.ready && !ec && mtime == g_conf.mtime)
+    if (!g_cfgFile || !g_cfgLoop || !g_cfgSpeed || !g_cfgRules)
         return false;
 
-    SConf next;
-    next.mtime = mtime;
-    next.ready = true;
-    std::ifstream in(path);
-    std::string   line;
-    while (std::getline(in, line)) {
-        const auto hash = line.find('#');
-        if (hash != std::string::npos)
-            line = line.substr(0, hash);
-        const auto eq = line.find('=');
-        if (eq == std::string::npos)
-            continue;
-        const auto key = lower(trim(line.substr(0, eq)));
-        const auto val = trim(line.substr(eq + 1));
-        if (key == "file")
-            next.file = expandHome(val);
-        else if (key == "loop")
-            next.loop = !(val == "0" || lower(val) == "false" || lower(val) == "no" || lower(val) == "off");
-        else if (key == "speed") {
-            try {
-                next.speed = std::stod(val);
-            } catch (...) {
-                next.speed = 1.0;
-            }
-        }
-    }
-    if (next.file.empty())
-        next.file = expandHome(defaultMediaPath());
+    const auto file     = expandHome(g_cfgFile->value().empty() ? defaultMediaPath() : g_cfgFile->value());
+    const auto rulesRaw = g_cfgRules->value();
+    const bool loop     = g_cfgLoop->value();
+    const auto speed    = static_cast<double>(g_cfgSpeed->value());
+    const bool changed  = !g_conf.ready || file != g_conf.file || loop != g_conf.loop || speed != g_conf.speed || rulesRaw != g_conf.rulesRaw;
+    if (!changed)
+        return false;
 
-    const bool changed = !g_conf.ready || next.file != g_conf.file || next.loop != g_conf.loop || next.speed != g_conf.speed;
-    g_conf             = next;
-    return changed;
+    if (rulesRaw != g_conf.rulesRaw)
+        g_conf.rules = parseRules(rulesRaw);
+    g_conf.file     = file;
+    g_conf.rulesRaw = rulesRaw;
+    g_conf.loop     = loop;
+    g_conf.speed    = speed;
+    g_conf.ready    = true;
+    return true;
 }
 
-static bool loadMedia() {
-    const auto path = g_conf.file;
+static void dropMedia() {
+    for (auto& [_, cover] : g_media) {
+        active = cover.get();
+        unloadMedia();
+        cover->tex.reset();
+    }
+    g_media.clear();
+    active = nullptr;
+}
+
+static bool loadMedia(const std::string& path) {
+    if (!active)
+        return false;
     if (path.empty() || !std::filesystem::exists(path)) {
-        g_missing = true;
+        active->missing = true;
         notifyOnce("noshare-cover: нет файла " + path);
         return false;
     }
@@ -630,57 +663,69 @@ static bool loadMedia() {
     else if (ext == ".mp4" || ext == ".m4v" || ext == ".mov" || ext == ".webm" || ext == ".mkv")
         ok = loadVideo(path);
     else {
+        active->error = ext;
         notifyOnce("noshare-cover: не знаю формат " + ext);
         return false;
     }
 
     if (!ok) {
         unloadMedia();
+        active->error = path;
         notifyOnce("noshare-cover: не открылся " + path);
         return false;
     }
-    g_error.clear();
-    g_missing = false;
+    active->error.clear();
+    active->missing = false;
     return true;
 }
 
-static bool ensureCover() {
-    if (readConfig()) {
-        unloadMedia();
-        g_missing = false;
-        g_error.clear();
-    }
-    if (g_kind != eKind::None)
-        return g_cover && g_cover->ok() && g_cover->m_texID;
-    if (g_missing) {
+static SCover* ensurePath(const std::string& path) {
+    auto it = g_media.find(path);
+    if (it == g_media.end())
+        it = g_media.emplace(path, std::make_unique<SCover>()).first;
+
+    auto* cover = it->second.get();
+    active      = cover;
+    if (cover->kind != eKind::None)
+        return (cover->tex && cover->tex->ok() && cover->tex->m_texID) ? cover : nullptr;
+    if (cover->missing) {
         std::error_code ec;
-        if (g_conf.file.empty() || !std::filesystem::exists(g_conf.file, ec))
-            return false;
-        g_missing = false;
-        g_error.clear();
-    } else if (!g_error.empty())
-        return false;
-    if (!loadMedia())
-        return false;
-    return g_cover && g_cover->ok() && g_cover->m_texID;
+        if (path.empty() || !std::filesystem::exists(path, ec))
+            return nullptr;
+        cover->missing = false;
+    } else if (!cover->error.empty())
+        return nullptr;
+    if (!loadMedia(path))
+        return nullptr;
+    return cover;
+}
+
+static std::string pathFor(const PHLWINDOW& w) {
+    for (const auto& rule : g_conf.rules) {
+        const auto& current = rule.title ? w->m_title : w->m_class;
+        const auto& initial = rule.title ? w->m_initialTitle : w->m_initialClass;
+        if (std::regex_search(current, rule.re) || (initial != current && std::regex_search(initial, rule.re)))
+            return rule.path;
+    }
+    return g_conf.file;
 }
 
 using RenderMonitorFn = void (*)(Screenshare::CScreenshareFrame*);
 
 static void paintCovers(Screenshare::CScreenshareFrame* self) {
-    if (!self || !self->m_session || !g_pHyprRenderer || !ensureCover())
+    if (!self || !self->m_session || !g_pHyprRenderer)
         return;
-
-    if (g_kind == eKind::Gif)
-        syncGif();
-    else if (g_kind == eKind::Video)
-        syncVideo();
+    if (readConfig()) {
+        dropMedia();
+        g_error.clear();
+    }
 
     const auto mon = g_pHyprRenderer->m_renderData.pMonitor.lock();
     if (!mon)
         return;
 
-    const auto capturePos = self->m_session->m_captureBox.pos();
+    const auto                 capturePos = self->m_session->m_captureBox.pos();
+    std::unordered_set<std::string> synced;
 
     for (const auto& w : Desktop::windowState()->windows()) {
         if (!w || !w->m_ruleApplicator || !w->m_ruleApplicator->noScreenShare().valueOrDefault())
@@ -703,12 +748,24 @@ static void paintCovers(Screenshare::CScreenshareFrame* self) {
         if (windowBox.w < 1 || windowBox.h < 1)
             continue;
 
+        const auto path  = pathFor(w);
+        auto*      cover = ensurePath(path);
+        if (!cover || !cover->tex || !cover->tex->ok() || !cover->tex->m_texID)
+            continue;
+        if (synced.insert(path).second) {
+            active = cover;
+            if (cover->kind == eKind::Gif)
+                syncGif();
+            else if (cover->kind == eKind::Video)
+                syncVideo();
+        }
+
         const bool dontRound = capturePos != Vector2D{} || (Fullscreen::controller() && Fullscreen::controller()->isFullscreen(w, Fullscreen::FSMODE_FULLSCREEN));
         const int  rounding  = dontRound ? 0 : static_cast<int>(std::lround(w->rounding() * mon->m_scale));
         const auto roundPow  = dontRound ? 2.F : w->roundingPower();
 
         g_pHyprRenderer->draw(CTexPassElement::SRenderData{
-                                  .tex           = g_cover,
+                                  .tex           = cover->tex,
                                   .box           = windowBox,
                                   .round         = rounding,
                                   .roundingPower = roundPow,
@@ -738,13 +795,18 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         }
     }
 
+    g_cfgFile  = Config::Values::makeConfigValue<Config::Values::CStringValue>("plugin:noshare-cover:file", "Default media for no_screen_share windows", Config::STRING{});
+    g_cfgLoop  = Config::Values::makeConfigValue<Config::Values::CBoolValue>("plugin:noshare-cover:loop", "Loop gif and video", true);
+    g_cfgSpeed = Config::Values::makeConfigValue<Config::Values::CFloatValue>("plugin:noshare-cover:speed", "Playback speed for gif and video", 1.F);
+    g_cfgRules = Config::Values::makeConfigValue<Config::Values::CStringValue>("plugin:noshare-cover:rules", "Per-window media, one 'class' or 'title' rule per line", Config::STRING{});
+    if (!g_cfgFile || !g_cfgLoop || !g_cfgSpeed || !g_cfgRules || !HyprlandAPI::addConfigValueV2(handle, g_cfgFile) || !HyprlandAPI::addConfigValueV2(handle, g_cfgLoop) ||
+        !HyprlandAPI::addConfigValueV2(handle, g_cfgSpeed) || !HyprlandAPI::addConfigValueV2(handle, g_cfgRules))
+        HyprlandAPI::addNotification(handle, "noshare-cover: конфиг не встал", CHyprColor{1.F, 0.2F, 0.2F, 1.F}, 5000);
+
     if (!addr) {
         HyprlandAPI::addNotification(handle, "noshare-cover: не нашёл renderMonitor", CHyprColor{1.F, 0.2F, 0.2F, 1.F}, 5000);
         return {"noshare-cover", "missing symbol", "vlad", "0.1"};
     }
-
-    if (!ensureCover())
-        return {"noshare-cover", "cover image missing", "vlad", "0.1"};
 
     g_hook = HyprlandAPI::createFunctionHook(handle, addr, reinterpret_cast<void*>(&hkRenderMonitor));
     if (!g_hook || !g_hook->hook()) {
@@ -756,6 +818,5 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
-    unloadMedia();
-    g_cover.reset();
+    dropMedia();
 }
