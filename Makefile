@@ -7,7 +7,39 @@ RUST_SRC := Cargo.toml Cargo.lock build.rs $(shell find src -name '*.rs')
 # VA-API помощник: отдельная .so с libva/libgbm, вшивается в плагин (см.
 # src/media/video/decode/vaapi.rs). NSC_VAAPI=0 — собрать без VA-API
 # (тогда не нужны libva, clang и заголовки libva).
+# Всё нужное для сборки проверяется сразу, со списком того, чего не хватает,
+# вместо молчаливого "failed to build" в hyprpm. NSC_VAAPI=0 — собрать без
+# VA-API (тогда clang и libva не нужны).
 NSC_VAAPI ?= 1
+have = $(shell command -v $(1) >/dev/null 2>&1 && echo y)
+havepc = $(shell pkg-config --exists $(1) 2>/dev/null && echo y)
+MISSING :=
+ifneq ($(shell $(CARGO) --version >/dev/null 2>&1 && echo y),y)
+MISSING += cargo(pacman:rust)
+endif
+ifneq ($(call have,pkg-config),y)
+MISSING += pkg-config(pacman:pkgconf)
+endif
+ifneq ($(call have,nasm),y)
+MISSING += nasm(pacman:nasm)
+endif
+ifneq ($(call havepc,hyprland),y)
+MISSING += hyprland-headers(hyprpm update / pacman:hyprland)
+endif
+ifeq ($(NSC_VAAPI),1)
+ifneq ($(call have,clang),y)
+MISSING += clang(pacman:clang)
+endif
+ifneq ($(call havepc,libva libva-drm),y)
+MISSING += libva(pacman:libva)
+endif
+ifneq ($(call havepc,gbm),y)
+MISSING += gbm(pacman:mesa)
+endif
+endif
+ifneq ($(strip $(MISSING)),)
+$(error noshare-cover: для сборки не хватает: $(strip $(MISSING)). Arch: sudo pacman -S --needed rust pkgconf nasm clang libva mesa. Без VA-API: make NSC_VAAPI=0)
+endif
 HELPER   := target/release/libnoshare_cover_vaapi.so
 HELPER_SRC := vaapi-helper/Cargo.toml $(shell find vaapi-helper/src vendor -name '*.rs')
 
