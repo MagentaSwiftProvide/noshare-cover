@@ -25,7 +25,11 @@
         let
           pkgs = import nixpkgs {
             inherit system;
-            overlays = [ hyprland.overlays.default ];
+            # overlays.default не тянет hyprland-guiutils, а default.nix Hyprland его требует.
+          overlays = [
+            hyprland.overlays.hyprland-packages
+            hyprland.overlays.hyprland-extras
+          ];
           };
         in
         {
