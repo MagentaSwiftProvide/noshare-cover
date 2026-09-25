@@ -188,13 +188,14 @@ hl.plugin.load("/usr/lib/hyprland/plugins/libnoshare-cover.so")
 
 ### Nix
 
-The plugin must be built against the Hyprland you run. With Hyprland from nixpkgs
-(`programs.hyprland.enable = true`):
+The plugin must be built against the Hyprland you run. `packages.default` is built against the
+flake's `hyprland` input, so make it follow yours:
 
 ```nix
 inputs.noshare-cover = {
   url = "github:gitscout-bot/noshare-cover";
   inputs.nixpkgs.follows = "nixpkgs";
+  inputs.hyprland.follows = "hyprland";
 };
 ```
 
@@ -202,20 +203,20 @@ inputs.noshare-cover = {
 wayland.windowManager.hyprland.plugins = [
   inputs.noshare-cover.packages.${pkgs.stdenv.hostPlatform.system}.default
 ];
+# or load it yourself: "${inputs.noshare-cover.packages.${system}.default}/lib/libnoshare-cover.so"
 ```
 
-Easiest with Home Manager: the module builds the plugin against whatever Hyprland you run
-(`wayland.windowManager.hyprland.package`, or the system's `programs.hyprland.package`), so
-the ABI always matches:
+Hyprland from nixpkgs instead of the hyprwm flake: use `.nixpkgs`. Or let Home Manager pick the
+right one automatically (builds against `wayland.windowManager.hyprland.package`, or the
+system's `programs.hyprland.package`):
 
 ```nix
 imports = [ inputs.noshare-cover.homeManagerModules.default ];
 programs.noshare-cover.enable = true;
 ```
 
-Otherwise pick the package yourself. With Hyprland from its own flake use `.hyprland-git` (and `inputs.hyprland.follows = "hyprland"`),
-or build against any Hyprland package: `inputs.noshare-cover.lib.mkNoshareCover pkgs yourHyprland`.
-There is also `overlays.default` (`pkgs.hyprlandPlugins.noshare-cover`).
+Any other Hyprland build: `inputs.noshare-cover.lib.mkNoshareCover pkgs yourHyprland`. There is
+also `overlays.default` (`pkgs.hyprlandPlugins.noshare-cover`, built against `final.hyprland`).
 
 ## Checking the GPU path
 

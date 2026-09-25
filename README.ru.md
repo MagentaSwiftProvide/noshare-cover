@@ -189,13 +189,14 @@ hl.plugin.load("/usr/lib/hyprland/plugins/libnoshare-cover.so")
 
 ### Nix
 
-Плагин нужно собирать против того Hyprland, который запущен. С Hyprland из nixpkgs
-(`programs.hyprland.enable = true`):
+Плагин нужно собирать против того Hyprland, который запущен. `packages.default` собирается
+против входа `hyprland` этого флейка, поэтому направьте его на свой:
 
 ```nix
 inputs.noshare-cover = {
   url = "github:gitscout-bot/noshare-cover";
   inputs.nixpkgs.follows = "nixpkgs";
+  inputs.hyprland.follows = "hyprland";
 };
 ```
 
@@ -203,21 +204,20 @@ inputs.noshare-cover = {
 wayland.windowManager.hyprland.plugins = [
   inputs.noshare-cover.packages.${pkgs.stdenv.hostPlatform.system}.default
 ];
+# или грузите сами: "${inputs.noshare-cover.packages.${system}.default}/lib/libnoshare-cover.so"
 ```
 
-Проще всего через Home Manager: модуль сам собирает плагин против того Hyprland, который у
-вас запущен (`wayland.windowManager.hyprland.package` или системный
-`programs.hyprland.package`), так что ABI совпадает всегда:
+Hyprland из nixpkgs, а не из флейка hyprwm: берите `.nixpkgs`. Или пусть Home Manager подберёт
+нужный сам (соберёт против `wayland.windowManager.hyprland.package` или системного
+`programs.hyprland.package`):
 
 ```nix
 imports = [ inputs.noshare-cover.homeManagerModules.default ];
 programs.noshare-cover.enable = true;
 ```
 
-Иначе выбирайте пакет сами. С Hyprland из его собственного флейка берите `.hyprland-git` (и
-`inputs.hyprland.follows = "hyprland"`) или соберите против любого пакета Hyprland:
-`inputs.noshare-cover.lib.mkNoshareCover pkgs вашHyprland`. Есть и `overlays.default`
-(`pkgs.hyprlandPlugins.noshare-cover`).
+Любая другая сборка Hyprland: `inputs.noshare-cover.lib.mkNoshareCover pkgs вашHyprland`. Есть и
+`overlays.default` (`pkgs.hyprlandPlugins.noshare-cover`, собирается против `final.hyprland`).
 
 ## Проверка GPU
 
