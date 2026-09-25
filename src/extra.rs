@@ -1,29 +1,29 @@
-//! Дополнительные прямоугольники от других плагинов (например, gloview:
-//! плитки превью окон с no_screen_share в оверлее).
+//! Extra rects from other plugins (e.g. gloview: previews of no_screen_share
+//! windows as overlay tiles).
 //!
 //! API v2 (`include/noshare_cover_api.h`):
-//! - у каждого плагина свой клиент: `register` → id, свои прямоугольники никто
-//!   чужой не сотрёт;
-//! - `set_rects(client, monitor, rects[])` атомарно заменяет набор клиента на
-//!   мониторе — нет окна «уже очистил, ещё не добавил», значит нет мерцания;
-//! - заливка: чёрным или обложкой конкретного окна (по адресу окна Hyprland,
-//!   как в `hyprctl clients`) — плитка в оверлее показывает ту же картинку,
-//!   что и само окно в скриншере;
-//! - `unregister` снимает всё клиента (вызывать при выгрузке плагина).
+//! - each plugin gets its own client: `register` → id, so no other client can
+//!   wipe its rects;
+//! - `set_rects(client, monitor, rects[])` atomically replaces the client's set on
+//!   a monitor: no "cleared but not re-added yet" window, so no flicker;
+//! - fill: black or the cover of a specific window (by Hyprland window address,
+//!   as in `hyprctl clients`), so the overlay tile shows the same image
+//!   as the window itself in the screencast;
+//! - `unregister` removes everything the client holds (call it on plugin unload).
 //!
 //! API v1 (`nsc_api_clear_extra_rects` / `nsc_api_add_extra_rect`)
-//! работает как раньше: это клиент «legacy» с чёрной заливкой.
+//! works as before: it's the "legacy" client with black fill.
 
 use std::sync::{Mutex, MutexGuard};
 
 pub const API_VERSION: u32 = 2;
 
-/// Чем залить прямоугольник.
+/// How to fill a rect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Fill {
     Black = 0,
-    /// Обложка окна `window`; если окна нет или у него нет обложки — чёрным.
+    /// Cover of `window`; black if the window doesn't exist or has no cover.
     WindowCover = 1,
 }
 
@@ -44,7 +44,7 @@ pub struct CoverRect {
     pub w: f64,
     pub h: f64,
     pub rounding: f64,
-    /// Адрес окна Hyprland (как `address` в `hyprctl clients`), 0 — нет окна.
+    /// Hyprland window address (as `address` in `hyprctl clients`), 0 = no window.
     pub window: u64,
     pub fill: Fill,
 }
@@ -65,7 +65,7 @@ impl CoverRect {
     }
 }
 
-/// Прямоугольник, как его видит отрисовка (с монитором).
+/// A rect as the renderer sees it (with its monitor).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MonitorRect {
     pub monitor: i64,
@@ -85,9 +85,9 @@ struct Clients {
     next_id: u64,
 }
 
-/// id клиента для старого API v1.
+/// Client id for the old v1 API.
 pub const LEGACY_CLIENT: u64 = 1;
-/// Сколько прямоугольников держим на клиента: защита от утечки у чужого плагина.
+/// Max rects per client: protects against a leak in another plugin.
 const MAX_RECTS_PER_CLIENT: usize = 4096;
 
 static CLIENTS: Mutex<Clients> = Mutex::new(Clients {
@@ -96,7 +96,7 @@ static CLIENTS: Mutex<Clients> = Mutex::new(Clients {
 });
 
 fn clients() -> MutexGuard<'static, Clients> {
-    // отравленный мьютекс тут не опасен: внутри только данные, берём как есть
+    // a poisoned mutex is harmless here: it only holds data, take it as is
     CLIENTS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -115,7 +115,7 @@ fn legacy(c: &mut Clients) -> &mut Client {
     client_mut(c, LEGACY_CLIENT).expect("legacy client exists")
 }
 
-/// Новый клиент. Имя — для отладки (кто насорил прямоугольниками).
+/// New client. The name is for debugging (who left the rects behind).
 pub fn register(name: &str) -> u64 {
     let mut c = clients();
     let id = c.next_id;
@@ -133,8 +133,8 @@ pub fn unregister(id: u64) {
     gone_list().retain(|g| g.client != id);
 }
 
-/// Заменить все прямоугольники клиента на мониторе. Пустой список — очистить монитор.
-/// `false` — клиента нет (не зарегистрирован или уже снят).
+/// Replace all of the client's rects on a monitor. An empty list clears the monitor.
+/// `false` if the client doesn't exist (never registered or already unregistered).
 pub fn set_rects(id: u64, monitor: i64, rects: &[CoverRect]) -> bool {
     let mut c = clients();
     let Some(cl) = client_mut(&mut c, id) else {
@@ -152,7 +152,7 @@ pub fn set_rects(id: u64, monitor: i64, rects: &[CoverRect]) -> bool {
     true
 }
 
-/// Очистить все мониторы клиента, не снимая регистрацию.
+/// Clear the client's rects on all monitors, keeping it registered.
 pub fn clear_client(id: u64) -> bool {
     let mut c = clients();
     match client_mut(&mut c, id) {
@@ -164,7 +164,7 @@ pub fn clear_client(id: u64) -> bool {
     }
 }
 
-/// Все прямоугольники монитора от всех клиентов (копия — замок не держим во время отрисовки).
+/// All rects on a monitor from all clients (a copy, so the lock isn't held while drawing).
 pub fn for_monitor(monitor: i64) -> Vec<CoverRect> {
     clients()
         .list
@@ -175,7 +175,7 @@ pub fn for_monitor(monitor: i64) -> Vec<CoverRect> {
         .collect()
 }
 
-/// Сброс при выгрузке плагина.
+/// Reset on plugin unload.
 pub fn reset() {
     gone_list().clear();
     let mut c = clients();
@@ -183,7 +183,7 @@ pub fn reset() {
     c.next_id = LEGACY_CLIENT + 1;
 }
 
-/// Для отладки: кто сколько держит.
+/// For debugging: how many rects each client holds.
 pub fn debug_summary() -> Vec<(String, usize)> {
     clients()
         .list
@@ -235,7 +235,7 @@ pub extern "C" fn nsc_api_add_extra_rect(
 
 // ---------------------------------------------------------------- API v2 (C)
 
-/// `noshare_cover_rect` из публичного заголовка.
+/// `noshare_cover_rect` from the public header.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct CRect {
@@ -268,7 +268,7 @@ pub extern "C" fn nsc_api_api_version() -> u32 {
 }
 
 /// # Safety
-/// `name` — NUL-строка или NULL.
+/// `name` is a NUL-terminated string or NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nsc_api_register_client(name: *const std::ffi::c_char) -> u64 {
     std::panic::catch_unwind(|| {
@@ -290,7 +290,7 @@ pub extern "C" fn nsc_api_unregister_client(client: u64) {
 }
 
 /// # Safety
-/// `rects` указывает на `count` элементов (или NULL при `count == 0`).
+/// `rects` points to `count` elements (or NULL when `count == 0`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nsc_api_set_rects(
     client: u64,
@@ -315,11 +315,11 @@ pub extern "C" fn nsc_api_clear_client_rects(client: u64) -> bool {
     std::panic::catch_unwind(|| clear_client(client)).unwrap_or(false)
 }
 
-// ---------------------------------------------------------------- «ухожу»
+// ---------------------------------------------------------------- "going away"
 
-/// Колбэк клиента: noshare-cover выгружается. Зовётся из PLUGIN_EXIT уже после
-/// снятия хука renderMonitor и до остановки ядра: клиент должен забыть все
-/// указатели на наши функции и может сразу занять renderMonitor сам.
+/// Client callback: noshare-cover is unloading. Called from PLUGIN_EXIT after the
+/// renderMonitor hook is removed and before the core stops: the client must drop
+/// all pointers to our functions and may take over renderMonitor right away.
 pub type GoneCb = unsafe extern "C" fn(user: *mut std::ffi::c_void);
 
 struct Gone {
@@ -335,7 +335,7 @@ fn gone_list() -> std::sync::MutexGuard<'static, Vec<Gone>> {
 }
 
 /// # Safety
-/// `cb` — валидная функция, `user` живёт до её вызова или до снятия (cb = NULL).
+/// `cb` is a valid function; `user` lives until it's called or unset (cb = NULL).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nsc_api_set_gone_callback(
     client: u64,
@@ -360,8 +360,8 @@ pub unsafe extern "C" fn nsc_api_set_gone_callback(
     .unwrap_or(false)
 }
 
-/// Разослать «ухожу» всем клиентам. Список забираем целиком до вызовов:
-/// колбэк может звать наши же функции (unregister) — без дедлока.
+/// Send "going away" to all clients. The list is taken out before calling:
+/// a callback may call our own functions (unregister) without deadlocking.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsc_api_notify_gone() {
     let list = std::mem::take(&mut *gone_list());
@@ -386,29 +386,29 @@ mod tests {
         }
     }
 
-    // Глобальное состояние — весь сценарий одним тестом, чтобы параллельные тесты не мешали.
+    // Global state: the whole scenario is one test so parallel tests don't interfere.
     #[test]
     fn api_scenarios() {
         reset();
 
-        // v1 ведёт себя как раньше
+        // v1 behaves as before
         nsc_api_add_extra_rect(1, 10.0, 10.0, 100.0, 50.0, -3.0);
-        nsc_api_add_extra_rect(1, 0.0, 0.0, 0.0, 50.0, 0.0); // пустой — отброшен
-        nsc_api_add_extra_rect(1, f64::NAN, 0.0, 10.0, 10.0, 0.0); // мусор — отброшен
+        nsc_api_add_extra_rect(1, 0.0, 0.0, 0.0, 50.0, 0.0); // empty, dropped
+        nsc_api_add_extra_rect(1, f64::NAN, 0.0, 10.0, 10.0, 0.0); // garbage, dropped
         let m1 = for_monitor(1);
         assert_eq!(m1.len(), 1);
         assert_eq!(m1[0].rounding, 0.0);
 
-        // v2: у клиента свой набор, чужой clear его не трогает
+        // v2: each client has its own set, another client's clear doesn't touch it
         let a = register("gloview");
         let b = register("other");
         assert!(set_rects(a, 1, &[r(1.0), r(2.0)]));
         assert!(set_rects(b, 1, &[r(3.0)]));
         assert_eq!(for_monitor(1).len(), 4);
-        nsc_api_clear_extra_rects(); // v1 clear чистит только legacy
+        nsc_api_clear_extra_rects(); // v1 clear only clears legacy
         assert_eq!(for_monitor(1).len(), 3);
 
-        // set_rects атомарно заменяет набор на мониторе, другие мониторы целы
+        // set_rects atomically replaces the set on a monitor, other monitors are untouched
         assert!(set_rects(a, 2, &[r(9.0)]));
         assert!(set_rects(a, 1, &[r(5.0)]));
         let xs: Vec<f64> = for_monitor(1).iter().map(|c| c.x).collect();
@@ -418,7 +418,7 @@ mod tests {
         );
         assert_eq!(for_monitor(2).len(), 1);
 
-        // заливка обложкой окна проходит насквозь
+        // window cover fill is passed through
         let cover = CRect {
             x: 0.0,
             y: 0.0,
@@ -431,19 +431,19 @@ mod tests {
         assert!(unsafe { nsc_api_set_rects(a, 3, &cover, 1) });
         let got = for_monitor(3);
         assert_eq!((got[0].fill, got[0].window), (Fill::WindowCover, 0xdead));
-        // неизвестная заливка = чёрная
+        // unknown fill = black
         let odd = CRect { fill: 77, ..cover };
         assert!(unsafe { nsc_api_set_rects(a, 3, &odd, 1) });
         assert_eq!(for_monitor(3)[0].fill, Fill::Black);
 
-        // снятый клиент больше ничего не держит и писать не может
+        // an unregistered client holds nothing and can't write
         unregister(a);
         assert!(!set_rects(a, 1, &[r(1.0)]));
-        assert_eq!(for_monitor(1).len(), 1); // остался только b
+        assert_eq!(for_monitor(1).len(), 1); // only b is left
         assert!(clear_client(b));
         assert!(for_monitor(1).is_empty());
 
-        // лимит на клиента
+        // per-client limit
         let c = register("spammer");
         let many = vec![r(1.0); MAX_RECTS_PER_CLIENT + 100];
         assert!(set_rects(c, 1, &many));
@@ -460,7 +460,7 @@ mod tests {
         static HITS: AtomicUsize = AtomicUsize::new(0);
         unsafe extern "C" fn cb(user: *mut std::ffi::c_void) {
             HITS.fetch_add(1, Ordering::SeqCst);
-            // колбэк зовёт наши функции — не должно быть дедлока
+            // the callback calls our functions: must not deadlock
             nsc_api_unregister_client(user as u64);
         }
         let id = register("gone-test");

@@ -1,8 +1,8 @@
-// Вшивание VA-API помощника (vaapi-helper) в плагин.
+// Embeds the VA-API helper (vaapi-helper) into the plugin.
 //
-// Makefile сначала собирает libnoshare_cover_vaapi.so, потом ядро с
-// NSC_VAAPI_HELPER=<путь>. Без переменной (cargo test, Windows, сборка без
-// VA-API) плагин просто не умеет VA-API и честно пишет это в ошибке.
+// The Makefile builds libnoshare_cover_vaapi.so first, then the core with
+// NSC_VAAPI_HELPER=<path>. Without the variable (cargo test, Windows, builds
+// without VA-API) the plugin has no VA-API support and says so in the error.
 use std::path::PathBuf;
 
 fn main() {

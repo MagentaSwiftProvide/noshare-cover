@@ -1,27 +1,27 @@
-//! Настройки плагина и параметры воспроизведения для конкретного окна.
+//! Plugin settings and per-window playback parameters.
 //!
-//! Глобальные значения живут в `plugin:no_screen_share_cover:*`, окно может
-//! переопределить `path_cover`, `speed` и `loop` правилом. Бэкенд декода и
-//! GPU задаются только глобально: это свойство машины, а не окна.
+//! Global values live in `plugin:no_screen_share_cover:*`; a window rule can
+//! override `path_cover`, `speed` and `loop`. The decode backend and GPU are
+//! global only: they are a property of the machine, not of a window.
 
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-/// Где декодировать видео.
+/// Where to decode video.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Backend {
-    /// GPU, если он есть и умеет кодек, иначе CPU.
+    /// GPU if present and it supports the codec, otherwise CPU.
     #[default]
     Auto,
-    /// Только GPU. Не получилось — ошибка, без тихого отката на CPU.
+    /// GPU only. On failure it is an error, no silent fallback to CPU.
     Gpu,
-    /// Только CPU.
+    /// CPU only.
     Cpu,
 }
 
 impl Backend {
-    /// Разбор значения из конфига. Неизвестное слово — `None`, чтобы вызывающий
-    /// мог показать понятную ошибку, а не молча выбрать что-то своё.
+    /// Parses a config value. An unknown word yields `None` so the caller can
+    /// show a clear error instead of silently picking something else.
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "" | "auto" => Some(Self::Auto),
@@ -32,15 +32,15 @@ impl Backend {
     }
 }
 
-/// Глобальные настройки плагина (уже разобранные и проверенные).
+/// Global plugin settings (already parsed and validated).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
-    /// Медиа по умолчанию для окон без своего правила.
+    /// Default media for windows without their own rule.
     pub path_cover: PathBuf,
     pub looped: bool,
     pub speed: f64,
     pub backend: Backend,
-    /// Конкретный render node (`/dev/dri/renderD129`). `None` — выбрать самим.
+    /// Specific render node (`/dev/dri/renderD129`). `None` picks one automatically.
     pub gpu_device: Option<PathBuf>,
 }
 
@@ -56,7 +56,7 @@ impl Default for Settings {
     }
 }
 
-/// Сырые значения, как их отдаёт конфиг Hyprland.
+/// Raw values as returned by the Hyprland config.
 #[derive(Debug, Clone, Default)]
 pub struct RawSettings<'a> {
     pub path_cover: &'a str,
@@ -66,10 +66,10 @@ pub struct RawSettings<'a> {
     pub gpu_device: &'a str,
 }
 
-/// Ошибка в конфиге: показываем пользователю, работаем на значениях по умолчанию.
+/// Config error: shown to the user, defaults are used instead.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ConfigError {
-    #[error("noshare-cover: неизвестный backend «{0}», жду auto, gpu или cpu")]
+    #[error("noshare-cover: unknown backend \"{0}\", expected auto, gpu or cpu")]
     UnknownBackend(String),
 }
 
@@ -102,7 +102,7 @@ impl Settings {
         (settings, err)
     }
 
-    /// Параметры воспроизведения по умолчанию (без правил окна).
+    /// Default playback parameters (no window rules applied).
     pub fn default_play(&self) -> PlayParams {
         PlayParams {
             path: self.path_cover.clone(),
@@ -112,8 +112,8 @@ impl Settings {
     }
 }
 
-/// Что и как играть в конкретном окне. Одинаковые параметры делят один декодер
-/// и одну текстуру, сколько бы окон их ни показывало.
+/// What to play in a given window and how. Identical parameters share one
+/// decoder and one texture, no matter how many windows show them.
 #[derive(Debug, Clone)]
 pub struct PlayParams {
     pub path: PathBuf,
@@ -122,7 +122,7 @@ pub struct PlayParams {
 }
 
 impl PlayParams {
-    /// Применить переопределения из правила окна. Пустое значение — не трогать.
+    /// Apply overrides from a window rule. Empty values are left untouched.
     pub fn with_rule(
         mut self,
         path: Option<&str>,
@@ -142,8 +142,8 @@ impl PlayParams {
     }
 }
 
-// speed сравниваем побитово: 1.0 и 1.0000001 — разные ключи, и это нормально,
-// NaN сюда не попадает (sanitize_speed).
+// speed is compared bitwise: 1.0 and 1.0000001 are different keys, which is fine;
+// NaN never gets here (sanitize_speed).
 impl PartialEq for PlayParams {
     fn eq(&self, other: &Self) -> bool {
         self.path == other.path
@@ -160,7 +160,7 @@ impl Hash for PlayParams {
     }
 }
 
-/// Скорость ≤ 0, NaN и бесконечность превращаются в 1.0.
+/// Speed ≤ 0, NaN and infinity become 1.0.
 pub fn sanitize_speed(speed: f64) -> f64 {
     if speed.is_finite() && speed > 0.0 {
         speed
@@ -169,7 +169,7 @@ pub fn sanitize_speed(speed: f64) -> f64 {
     }
 }
 
-/// Как в исходном плагине: всё, кроме 0/false/no/off, — правда.
+/// Same as the original plugin: anything except 0/false/no/off is true.
 pub fn truthy(raw: &str) -> bool {
     !matches!(
         raw.trim().to_ascii_lowercase().as_str(),
@@ -183,7 +183,7 @@ pub fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// `~` и `~/…` раскрываются в домашний каталог, остальное как есть.
+/// `~` and `~/…` expand to the home directory; everything else is kept as is.
 pub fn expand_home(path: &str) -> PathBuf {
     if path == "~" {
         return home_dir().unwrap_or_else(|| PathBuf::from(path));
@@ -196,7 +196,7 @@ pub fn expand_home(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// Файл по умолчанию: первый существующий из списка в `~/.config/hypr`, как раньше.
+/// Default file: the first existing one from the list in `~/.config/hypr`, as before.
 pub fn default_media_path() -> PathBuf {
     default_media_path_in(&config_dir())
 }

@@ -1,32 +1,32 @@
 /*
- * noshare-cover — публичный API для других плагинов Hyprland.
+ * noshare-cover: public API for other Hyprland plugins.
  *
- * Зачем: плагин вроде оверлея окон (gloview) рисует превью окна с no_screen_share
- * у себя в кадре. noshare-cover закрывает в скриншере только само окно, а превью
- * утекло бы. Через этот API плагин сообщает «вот тут тоже закрой» — чёрным
- * или обложкой того самого окна.
+ * Why: a window overlay plugin (e.g. gloview) draws previews of no_screen_share
+ * windows into its own frame. noshare-cover only hides the window itself in the
+ * screencast, so the preview would leak. Through this API a plugin says "cover
+ * this area too", either in black or with that window's cover.
  *
- * Подключение — только этот заголовок, линковать ничего не нужно:
+ * Usage: include this header only, nothing to link:
  *
  *     #include "noshare_cover_api.h"
  *
- *     static noshare_cover_api g_nsc;          // в PLUGIN_INIT:
+ *     static noshare_cover_api g_nsc;          // in PLUGIN_INIT:
  *     if (noshare_cover_bind(&g_nsc) == 0)
  *         g_client = g_nsc.register_client("gloview");
  *
- *     // каждый кадр оверлея (или когда плитки сдвинулись), на каждый монитор:
+ *     // every overlay frame (or when tiles move), per monitor:
  *     noshare_cover_rect r[] = {{x, y, w, h, rounding, window_address, NOSHARE_COVER_FILL_WINDOW}};
  *     g_nsc.set_rects(g_client, monitor_id, r, 1);
  *
- *     // оверлей закрылся:           g_nsc.set_rects(g_client, monitor_id, NULL, 0);
- *     // выгрузка своего плагина:    g_nsc.unregister_client(g_client); noshare_cover_unbind(&g_nsc);
+ *     // overlay closed:             g_nsc.set_rects(g_client, monitor_id, NULL, 0);
+ *     // unloading your plugin:      g_nsc.unregister_client(g_client); noshare_cover_unbind(&g_nsc);
  *
- * Координаты — глобальные логические пиксели раскладки (то же пространство, что
- * позиция и размер окна). noshare-cover сам вычтет позицию монитора, умножит на
- * scale и учтёт область захвата. Прямоугольники живут, пока их не заменят.
+ * Coordinates are global logical layout pixels (same space as window position
+ * and size). noshare-cover subtracts the monitor position, multiplies by scale
+ * and accounts for the capture region itself. Rects persist until replaced.
  *
- * Почему bind через dl_iterate_phdr: Hyprland грузит плагины с RTLD_LOCAL,
- * dlsym(RTLD_DEFAULT, ...) их символы не видит.
+ * Why bind via dl_iterate_phdr: Hyprland loads plugins with RTLD_LOCAL, so
+ * dlsym(RTLD_DEFAULT, ...) can't see their symbols.
  */
 #ifndef NOSHARE_COVER_API_H
 #define NOSHARE_COVER_API_H
@@ -39,20 +39,20 @@
 
 enum {
     NOSHARE_COVER_FILL_BLACK  = 0,
-    /* Обложка окна `window` (по его правилам или глобальная). Нет окна/обложки — чёрным. */
+    /* Cover of `window` (per its rules or the global one). No window/cover: black. */
     NOSHARE_COVER_FILL_WINDOW = 1,
 };
 
 typedef struct {
     double   x, y, w, h;
     double   rounding;
-    uint64_t window; /* адрес окна, как `address` в `hyprctl clients -j`; 0 — нет */
+    uint64_t window; /* window address, as `address` in `hyprctl clients -j`; 0 = none */
     uint32_t fill;   /* NOSHARE_COVER_FILL_* */
 } noshare_cover_rect;
 
 typedef struct {
-    uint32_t version; /* что сказал сам плагин */
-    void*    handle;  /* RTLD_NOLOAD-ссылка, закрывается в noshare_cover_unbind */
+    uint32_t version; /* as reported by the plugin */
+    void*    handle;  /* RTLD_NOLOAD reference, closed in noshare_cover_unbind */
 
     /* v2 */
     uint64_t (*register_client)(const char* name);
@@ -60,13 +60,13 @@ typedef struct {
     bool (*set_rects)(uint64_t client, int monitor_id, const noshare_cover_rect* rects, size_t count);
     bool (*clear_client_rects)(uint64_t client);
 
-    /* v2, необязательно (NULL у старых сборок): «ухожу». Колбэк зовётся при выгрузке
-     * noshare-cover, уже после снятия его хука renderMonitor: забудьте все указатели
-     * отсюда, renderMonitor свободен. С колбэком можно сразу отпустить handle
-     * (noshare_cover_drop_handle), чтобы не мешать выгрузке noshare-cover. */
+    /* v2, optional (NULL in older builds): "going away". The callback fires when
+     * noshare-cover unloads, after its renderMonitor hook is removed: drop all pointers
+     * from here, renderMonitor is free. With a callback set you can release the handle
+     * right away (noshare_cover_drop_handle) so it doesn't block noshare-cover unload. */
     bool (*set_gone_callback)(uint64_t client, void (*cb)(void* user), void* user);
 
-    /* v1, оставлены для совместимости */
+    /* v1, kept for compatibility */
     void (*clear_extra_rects)(void);
     void (*add_extra_rect)(int monitor_id, double x, double y, double w, double h, double rounding);
 } noshare_cover_api;
@@ -89,9 +89,9 @@ static int noshare_cover__find(struct dl_phdr_info* info, size_t size, void* dat
 }
 
 /*
- * Найти загруженный noshare-cover и привязать функции.
- * 0 — готово (v2 доступен); 1 — плагин не загружен; 2 — старая версия без v2
- * (v1-функции всё равно заполнены, если есть); 3 — ошибка dlopen.
+ * Find the loaded noshare-cover and bind its functions.
+ * 0: ok (v2 available); 1: plugin not loaded; 2: old version without v2
+ * (v1 functions are still filled in if present); 3: dlopen failed.
  */
 static inline int noshare_cover_bind(noshare_cover_api* api) {
     memset(api, 0, sizeof *api);
@@ -126,9 +126,9 @@ static inline int noshare_cover_bind(noshare_cover_api* api) {
     return (api->register_client && api->unregister_client && api->set_rects && api->clear_client_rects) ? 0 : 2;
 }
 
-/* Отпустить RTLD_NOLOAD-ссылку, сохранив указатели. Только вместе с set_gone_callback:
- * без неё после выгрузки noshare-cover указатели повиснут. Держать handle дольше
- * не надо — пока он открыт, dlclose не выгружает noshare-cover из памяти. */
+/* Release the RTLD_NOLOAD reference but keep the pointers. Only together with
+ * set_gone_callback: without it the pointers dangle after noshare-cover unloads. Don't
+ * hold the handle longer than needed: while it's open, dlclose can't unload noshare-cover. */
 static inline void noshare_cover_drop_handle(noshare_cover_api* api) {
     if (api->handle)
         dlclose(api->handle);

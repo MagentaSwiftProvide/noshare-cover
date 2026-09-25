@@ -1,6 +1,6 @@
-//! Декодеры. Программные вшиты (rav1d) или грузятся из системы на лету
-//! (openh264, libvpx), аппаратные — VA-API и NVDEC — тоже через dlopen:
-//! плагин не тянет жёстких зависимостей и не падает, если библиотеки нет.
+//! Decoders. Software ones are either built in (rav1d) or loaded from the system
+//! at runtime (openh264, libvpx); hardware ones (VA-API and NVDEC) also go through
+//! dlopen, so the plugin has no hard dependencies and doesn't crash when a library is missing.
 
 #[cfg(feature = "cpu-av1")]
 pub mod av1;

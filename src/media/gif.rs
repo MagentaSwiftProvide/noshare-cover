@@ -1,6 +1,6 @@
-//! GIF с правильным композитингом кадров (disposal Keep / Background / Previous),
-//! как в исходном плагине. Кадры декодируются один раз при открытии, холст
-//! собирается по шагам: вперёд — докладываем кадры, назад (петля) — с нуля.
+//! GIF with correct frame compositing (disposal Keep / Background / Previous),
+//! as in the original plugin. Frames are decoded once on open, and the canvas
+//! is built step by step: going forward adds frames, going back (loop) starts over.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -19,20 +19,20 @@ struct GifFrame {
     top: u32,
     width: u32,
     height: u32,
-    /// RGBA кадра; прозрачные пиксели имеют alpha = 0.
+    /// Frame RGBA; transparent pixels have alpha = 0.
     rgba: Vec<u8>,
 }
 
 pub struct GifSource {
     width: u32,
     height: u32,
-    /// Цвет фона в BGRA (как на холсте).
+    /// Background color in BGRA (same as the canvas).
     bg: [u8; 4],
     frames: Vec<GifFrame>,
     total: Duration,
     canvas: Vec<u8>,
     backup: Option<Vec<u8>>,
-    /// Индекс последнего наложенного кадра, `None` — холст чистый.
+    /// Index of the last composited frame; `None` means a clean canvas.
     shown: Option<usize>,
     clock: PlaybackClock,
     generation: u64,
@@ -55,7 +55,7 @@ impl GifSource {
 
         let (width, height) = (u32::from(dec.width()), u32::from(dec.height()));
         if width == 0 || height == 0 {
-            return Err(err(&"пустой GIF"));
+            return Err(err(&"empty GIF"));
         }
 
         let bg = match (dec.bg_color(), dec.global_palette()) {
@@ -67,7 +67,7 @@ impl GifSource {
 
         let mut frames = Vec::new();
         while let Some(f) = dec.read_next_frame().map_err(|e| err(&e))? {
-            // Задержка в сотых секунды; 0 и 1 браузеры и исходный плагин считают как 10.
+            // Delay is in centiseconds; browsers and the original plugin treat 0 and 1 as 10.
             let cs = if f.delay <= 1 { 10 } else { u64::from(f.delay) };
             frames.push(GifFrame {
                 delay: super::ms(cs * 10),
@@ -80,7 +80,7 @@ impl GifSource {
             });
         }
         if frames.is_empty() {
-            return Err(err(&"в GIF нет кадров"));
+            return Err(err(&"GIF has no frames"));
         }
         let total = frames.iter().map(|f| f.delay).sum();
 
@@ -112,7 +112,7 @@ impl GifSource {
         self.backup = None;
     }
 
-    /// Какой кадр виден в позиции `pos`.
+    /// Which frame is visible at position `pos`.
     fn frame_at(&self, pos: Duration) -> usize {
         let mut acc = Duration::ZERO;
         for (i, f) in self.frames.iter().enumerate() {
@@ -152,7 +152,7 @@ impl GifSource {
                 let s = ((y * fw + x) * 4) as usize;
                 let src = &f.rgba[s..s + 4];
                 if src[3] == 0 {
-                    continue; // прозрачный пиксель кадра — под ним остаётся холст
+                    continue; // transparent frame pixel: the canvas shows through
                 }
                 let d = ((dy * self.width + dx) * 4) as usize;
                 self.canvas[d..d + 4].copy_from_slice(&[src[2], src[1], src[0], 255]);
@@ -160,7 +160,7 @@ impl GifSource {
         }
     }
 
-    /// Убрать след предыдущего кадра по его disposal и наложить следующий.
+    /// Dispose of the previous frame per its disposal method and composite the next one.
     fn step(&mut self) {
         let next = self.shown.map_or(0, |i| i + 1);
         if next >= self.frames.len() {
@@ -195,7 +195,7 @@ impl GifSource {
         if self.shown.is_some_and(|i| target < i) {
             self.clear_canvas();
         }
-        // защита от зацикливания, как в исходнике
+        // guard against infinite loops, as in the original
         for _ in 0..=self.frames.len() {
             if self.shown == Some(target) {
                 break;
@@ -238,7 +238,7 @@ mod tests {
     use super::*;
     use gif::{Encoder, Frame as GFrame, Repeat};
 
-    /// 2x1 GIF: кадр 0 красит левый пиксель в красный (Keep), кадр 1 — правый в синий.
+    /// 2x1 GIF: frame 0 paints the left pixel red (Keep), frame 1 paints the right one blue.
     fn write_gif(path: &Path, dispose0: DisposalMethod) {
         let palette = [255, 0, 0, 0, 0, 255, 0, 0, 0];
         let mut f = std::fs::File::create(path).unwrap();
@@ -281,7 +281,7 @@ mod tests {
 
         let t0 = Instant::now();
         assert!(g.poll(t0).unwrap().is_some());
-        assert_eq!(g.pixel(0, 0), [0, 0, 255, 255]); // красный в BGRA
+        assert_eq!(g.pixel(0, 0), [0, 0, 255, 255]); // red in BGRA
 
         assert!(
             g.poll(t0 + ms(50)).unwrap().is_none(),
@@ -293,9 +293,9 @@ mod tests {
             [0, 0, 255, 255],
             "Keep leaves previous frame"
         );
-        assert_eq!(g.pixel(1, 0), [255, 0, 0, 255]); // синий
+        assert_eq!(g.pixel(1, 0), [255, 0, 0, 255]); // blue
 
-        // петля: снова кадр 0, холст собирается заново
+        // loop: back to frame 0, the canvas is rebuilt from scratch
         g.poll(t0 + ms(310)).unwrap();
         assert_eq!(g.shown, Some(0));
         std::fs::remove_dir_all(p.parent().unwrap()).unwrap();

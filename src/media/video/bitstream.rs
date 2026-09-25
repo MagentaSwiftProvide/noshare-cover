@@ -1,19 +1,19 @@
-//! Приведение H.264/HEVC из контейнеров к Annex-B.
+//! Converts H.264/HEVC from container format to Annex-B.
 //!
-//! MP4 и Matroska хранят H.264/HEVC как «длина + NAL» (формат AVCC/HVCC), а
-//! параметры (SPS/PPS/VPS) — отдельно, в avcC/hvcC. Декодеры (openh264, парсеры
-//! VA-API) ждут Annex-B: `00 00 00 01` + NAL, параметры — в потоке перед
-//! ключевым кадром. Форматы avcC/hvcC одинаковы в обоих контейнерах, поэтому
-//! разбираем их здесь сами, по сырым байтам.
+//! MP4 and Matroska store H.264/HEVC as "length + NAL" (AVCC/HVCC format), with
+//! parameter sets (SPS/PPS/VPS) kept separately in avcC/hvcC. Decoders (openh264, VA-API
+//! parsers) expect Annex-B: `00 00 00 01` + NAL, with parameter sets in-stream before
+//! each keyframe. The avcC/hvcC layouts are the same in both containers, so
+//! we parse them here ourselves from raw bytes.
 
 const START_CODE: [u8; 4] = [0, 0, 0, 1];
 
-/// Разобранная конфигурация кодека: размер поля длины и наборы параметров.
+/// Parsed codec config: length field size and parameter sets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NalConfig {
-    /// Сколько байт занимает длина NAL в сэмпле (1, 2 или 4).
+    /// Size of the NAL length prefix in a sample, in bytes (1, 2 or 4).
     pub length_size: usize,
-    /// VPS/SPS/PPS в порядке, в котором их надо отдать декодеру.
+    /// VPS/SPS/PPS in the order they must be fed to the decoder.
     pub parameter_sets: Vec<Vec<u8>>,
 }
 
@@ -75,7 +75,7 @@ pub fn parse_hvcc(raw: &[u8]) -> Option<NalConfig> {
     if r.u8()? != 1 {
         return None;
     }
-    // profile/tier/level и прочее до lengthSizeMinusOne: 20 байт
+    // profile/tier/level etc. up to lengthSizeMinusOne: 20 bytes
     r.skip(20)?;
     let length_size = usize::from(r.u8()? & 0b11) + 1;
     let arrays = r.u8()?;
@@ -94,8 +94,8 @@ pub fn parse_hvcc(raw: &[u8]) -> Option<NalConfig> {
     })
 }
 
-/// Сэмпл «длина + NAL» → Annex-B. Для ключевого кадра впереди — наборы параметров.
-/// `None` — сэмпл битый (длина вылезает за край), такой кадр выбрасываем.
+/// "length + NAL" sample → Annex-B. Keyframes get the parameter sets prepended.
+/// `None`: the sample is broken (a length runs past the end); drop that frame.
 pub fn to_annexb(sample: &[u8], cfg: &NalConfig, keyframe: bool) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(sample.len() + 64);
     if keyframe {
@@ -139,7 +139,7 @@ mod tests {
         assert_eq!(cfg.length_size, 4);
         assert_eq!(cfg.parameter_sets, vec![vec![0x67, 1, 2], vec![0x68, 3]]);
 
-        // два NAL в сэмпле
+        // two NALs in one sample
         let sample = [0, 0, 0, 2, 0x65, 9, 0, 0, 0, 1, 0x06];
         let key = to_annexb(&sample, &cfg, true).unwrap();
         assert_eq!(
@@ -182,7 +182,7 @@ mod tests {
         let mut v = vec![1u8];
         v.extend([0u8; 20]);
         v.push(0xf3); // lengthSizeMinusOne = 3
-        v.push(2); // два массива
+        v.push(2); // two arrays
         for (ty, nal) in [(32u8, vec![0x40, 1]), (33, vec![0x42, 2, 3])] {
             v.push(0x80 | ty);
             v.extend(1u16.to_be_bytes());

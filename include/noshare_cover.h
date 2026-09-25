@@ -1,9 +1,9 @@
 /*
- * noshare-cover: граница между Rust-ядром и C++-прослойкой Hyprland.
- * Реализация — src/ffi.rs и src/extra.rs. Меняются вместе.
+ * noshare-cover: boundary between the Rust core and the Hyprland C++ shim.
+ * Implemented in src/ffi.rs and src/extra.rs. Change them together.
  *
- * Все функции вызываются из потока рендера Hyprland. Ни одна не бросает и не
- * паникует наружу. Данные кадра (pixels, fd) живут до nsc_end_frame().
+ * All functions are called from the Hyprland render thread. None of them throws
+ * or panics across the boundary. Frame data (pixels, fd) lives until nsc_end_frame().
  */
 #ifndef NOSHARE_COVER_H
 #define NOSHARE_COVER_H
@@ -12,7 +12,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* типы публичного API; binder прослойке не нужен — она и есть этот плагин */
+/* public API types; the shim doesn't need the binder, it is this plugin */
 #define NOSHARE_COVER_NO_BINDER
 #include "noshare_cover_api.h"
 
@@ -21,14 +21,14 @@ extern "C" {
 #endif
 
 typedef struct {
-    const char* path_cover; /* "" — файл по умолчанию из ~/.config/hypr */
+    const char* path_cover; /* "" = default file from ~/.config/hypr */
     bool        loop;
     double      speed;
     const char* backend;    /* "auto" | "gpu" | "cpu" */
-    const char* gpu_device; /* "" — первый render node */
+    const char* gpu_device; /* "" = first render node */
 } nsc_settings;
 
-/* Переопределения из правила окна; NULL — поле не задано. */
+/* Overrides from a window rule; NULL = field not set. */
 typedef struct {
     const char* rule_path;
     const char* rule_speed;
@@ -38,7 +38,7 @@ typedef struct {
 enum {
     NSC_FRAME_NONE   = 0,
     NSC_FRAME_CPU    = 1, /* pixels: premultiplied BGRA, fourcc = DRM_FORMAT_ARGB8888 */
-    NSC_FRAME_DMABUF = 2, /* planes[]: fd НЕ закрывать, владелец — ядро; EGL владение не забирает */
+    NSC_FRAME_DMABUF = 2, /* planes[]: do NOT close fd, the core owns it; EGL doesn't take ownership */
 };
 
 typedef struct {
@@ -48,8 +48,8 @@ typedef struct {
 } nsc_plane;
 
 typedef struct {
-    uint64_t       cover_id;   /* стабильный ключ кэша текстур */
-    uint64_t       generation; /* сменился — текстуру обновить */
+    uint64_t       cover_id;   /* stable texture cache key */
+    uint64_t       generation; /* changed: update the texture */
     uint32_t       kind;
     uint32_t       width;
     uint32_t       height;
@@ -61,17 +61,17 @@ typedef struct {
     nsc_plane      planes[4];
 } nsc_frame;
 
-/* Прямоугольник другого плагина (см. noshare_cover_api.h), уже без клиента. */
+/* Rect from another plugin (see noshare_cover_api.h), client already stripped. */
 typedef struct {
     double   x, y, w, h, rounding;
-    uint64_t window; /* адрес окна для заливки его обложкой, 0 — нет */
-    uint32_t fill;   /* 0 — чёрный, 1 — обложка окна */
+    uint64_t window; /* window address to fill with its cover, 0 = none */
+    uint32_t fill;   /* 0 = black, 1 = window cover */
 } nsc_extra_rect;
 
 /*
- * Раскладка структур закреплена числами с обеих сторон: здесь static_assert,
- * в Rust — тест ffi::tests::abi_layout. Разъедутся — упадёт сборка или тест,
- * а не Hyprland в рантайме. Числа для LP64 (x86_64 / aarch64 Linux).
+ * Struct layout is pinned by numbers on both sides: static_assert here, the
+ * ffi::tests::abi_layout test in Rust. If they drift, the build or the test fails,
+ * not Hyprland at runtime. Numbers are for LP64 (x86_64 / aarch64 Linux).
  */
 #if defined(__LP64__)
 #ifdef __cplusplus
@@ -101,9 +101,9 @@ bool     nsc_cover_alive(uint64_t cover_id);
 size_t   nsc_take_notification(char* buf, size_t cap);
 size_t   nsc_extra_rects(int64_t monitor_id, nsc_extra_rect* out, size_t cap);
 
-/* Реализация публичного ABI (noshare_cover_api.h). Наружу его выставляют
- * обёртки noshare_cover_* в shim/plugin.cpp: весь Rust-архив линкуется
- * скрытым (--exclude-libs), чтобы не делить символы с другими плагинами. */
+/* Public ABI implementation (noshare_cover_api.h). It is exported by the
+ * noshare_cover_* wrappers in shim/plugin.cpp: the whole Rust archive is linked
+ * hidden (--exclude-libs) so it doesn't share symbols with other plugins. */
 uint32_t nsc_api_api_version(void);
 bool     nsc_api_set_gone_callback(uint64_t client, void (*cb)(void* user), void* user);
 void     nsc_api_notify_gone(void);

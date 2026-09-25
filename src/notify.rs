@@ -1,5 +1,5 @@
-//! Уведомления пользователю. Как в исходном плагине: одно и то же сообщение не
-//! повторяется подряд, иначе ошибка в конфиге заспамила бы экран на каждый кадр.
+//! User notifications. As in the original plugin, the same message is never
+//! repeated back to back; otherwise a config error would spam the screen every frame.
 
 use std::collections::VecDeque;
 
@@ -16,14 +16,14 @@ impl Notifier {
             return;
         }
         self.last = Some(msg.clone());
-        // очередь не растёт бесконечно, если прослойка почему-то не забирает сообщения
+        // keep the queue bounded in case the shim stops draining it
         if self.queue.len() >= 16 {
             self.queue.pop_front();
         }
         self.queue.push_back(msg);
     }
 
-    /// После смены конфига прошлые ошибки снова можно показать.
+    /// After a config change, previous errors may be shown again.
     pub fn reset(&mut self) {
         self.last = None;
     }

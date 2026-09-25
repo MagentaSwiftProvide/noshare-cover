@@ -1,10 +1,10 @@
-//! Видео: декод в отдельном потоке, наружу — только последний готовый кадр.
+//! Video: decoding runs on its own thread; only the latest ready frame is exposed.
 //!
-//! Поток спит, когда кадры никто не спрашивает (нет активного скриншера) —
-//! так же, как исходный плагин (порог 400 мс). После пробуждения часы
-//! стартуют с текущего кадра, а не догоняют пропущенное время.
-//! Drop источника = остановка и join потока: при выгрузке плагина ничего не
-//! остаётся висеть.
+//! The thread sleeps while nobody requests frames (no active screen capture),
+//! same as the original plugin (400 ms threshold). After waking, the clock
+//! restarts from the current frame instead of catching up on missed time.
+//! Dropping the source stops and joins the thread, so nothing is left
+//! running after the plugin is unloaded.
 
 pub mod backend;
 pub mod bitstream;
@@ -23,13 +23,13 @@ use crate::config::Settings;
 use crate::frame::Frame;
 use pipeline::{Next, Pipeline};
 
-/// Сколько кадров никто не спрашивал, прежде чем поток уснёт.
+/// How long frames can go unrequested before the thread goes to sleep.
 const IDLE_AFTER: Duration = Duration::from_millis(400);
-/// Кадр, опоздавший больше чем на это, выбрасываем, а не показываем.
+/// A frame later than this is dropped instead of shown.
 const DROP_LATE: Duration = Duration::from_millis(80);
-/// Сколько первый опрос новой обложки ждёт первый кадр. Один раз на обложку:
-/// без этого первый снимок экрана (grim, начало трансляции) выходил бы с
-/// чёрным прямоугольником вместо обложки.
+/// How long the first poll of a new cover waits for the first frame. Once per cover:
+/// without it, the first screenshot (grim, stream start) would show
+/// a black rectangle instead of the cover.
 const FIRST_FRAME_WAIT: Duration = Duration::from_millis(120);
 
 #[derive(Default)]
@@ -38,7 +38,7 @@ struct Shared {
     generation: u64,
     watched: Option<Instant>,
     quit: bool,
-    /// Фатальная ошибка потока (для показа пользователю).
+    /// Fatal thread error (shown to the user).
     error: Option<String>,
     ended: bool,
 }
@@ -87,13 +87,13 @@ impl VideoSource {
         let worker = std::thread::Builder::new()
             .name("noshare-video".into())
             .spawn(move || {
-                // паника в декодере не должна утащить композитор
+                // a panic in the decoder must not take down the compositor
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     run(pipeline, speed, &s2)
                 }));
                 if r.is_err() {
                     let mut st = s2.lock();
-                    st.error.get_or_insert_with(|| "декодер упал".into());
+                    st.error.get_or_insert_with(|| "decoder crashed".into());
                     s2.cv.notify_all();
                 }
             })
@@ -165,11 +165,11 @@ fn is_watched(st: &Shared) -> bool {
 }
 
 fn run(mut pipe: Pipeline, speed: f64, sync: &Sync) {
-    // (время на стене, pts) — точка отсчёта часов
+    // (wall time, pts): the clock's reference point
     let mut origin: Option<(Instant, Duration)> = None;
 
     loop {
-        // спим, пока на нас не смотрят
+        // sleep while nobody is watching
         {
             let mut st = sync.lock();
             let mut slept = false;
@@ -185,7 +185,7 @@ fn run(mut pipe: Pipeline, speed: f64, sync: &Sync) {
                 return;
             }
             if slept {
-                origin = None; // после сна не догоняем, а продолжаем с текущего места
+                origin = None; // after sleeping, resume from the current position instead of catching up
             }
         }
 
@@ -194,7 +194,7 @@ fn run(mut pipe: Pipeline, speed: f64, sync: &Sync) {
             Ok(Next::End) => {
                 let mut st = sync.lock();
                 st.ended = true;
-                // ролик кончился без петли: последний кадр остаётся на экране
+                // video ended without looping: the last frame stays on screen
                 while !st.quit {
                     st = sync.cv.wait(st).unwrap_or_else(|e| e.into_inner());
                 }
@@ -213,7 +213,7 @@ fn run(mut pipe: Pipeline, speed: f64, sync: &Sync) {
         let now = Instant::now();
 
         if due > now {
-            // ждём момент показа, но просыпаемся на quit
+            // wait until display time, but wake up on quit
             let mut st = sync.lock();
             let deadline = due;
             while !st.quit {
@@ -231,7 +231,7 @@ fn run(mut pipe: Pipeline, speed: f64, sync: &Sync) {
                 return;
             }
         } else if now - due > DROP_LATE {
-            continue; // опоздали — выбрасываем, чтобы не отставать всё сильнее
+            continue; // late: drop it so we don't fall further behind
         }
 
         let mut st = sync.lock();
@@ -242,7 +242,7 @@ fn run(mut pipe: Pipeline, speed: f64, sync: &Sync) {
             data: frame.data,
         });
         drop(st);
-        sync.cv.notify_all(); // первый опрос может ждать этот кадр
+        sync.cv.notify_all(); // the first poll may be waiting for this frame
     }
 }
 
@@ -292,7 +292,7 @@ mod tests {
 
     #[test]
     fn drop_joins_thread_quickly() {
-        let mut s = source(1000, 1000, true); // длинные паузы между кадрами
+        let mut s = source(1000, 1000, true); // long gaps between frames
         wait_frame(&mut s, Duration::from_secs(2));
         let t = Instant::now();
         drop(s);

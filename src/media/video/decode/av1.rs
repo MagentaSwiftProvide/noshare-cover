@@ -1,7 +1,7 @@
-//! AV1 на CPU: rav1d (dav1d, переписанный на Rust, с тем же C API и asm-ядрами).
+//! AV1 on CPU: rav1d (dav1d rewritten in Rust, with the same C API and asm kernels).
 //!
-//! Ничего не грузится из системы — декодер вшит в плагин. Кадры отдаются в
-//! YUV, переводим в BGRA через [`yuv`](super::super::yuv).
+//! Nothing is loaded from the system: the decoder is built into the plugin. Frames come out as
+//! YUV and are converted to BGRA via [`yuv`](super::super::yuv).
 
 use std::ptr::NonNull;
 use std::time::Duration;
@@ -29,19 +29,19 @@ pub struct Av1Decoder {
     ctx: Option<Dav1dContext>,
 }
 
-// Контекст dav1d живёт в одном потоке декодера; сам он потокобезопасен
-// (внутри свои рабочие потоки), наружу указатель не уходит.
+// The dav1d context lives on the single decoder thread; it is thread-safe itself
+// (it runs its own worker threads), and the pointer never escapes.
 unsafe impl Send for Av1Decoder {}
 
 impl Av1Decoder {
     pub fn new() -> PipeResult<Self> {
         let mut s = std::mem::MaybeUninit::<Dav1dSettings>::uninit();
         let mut ctx: Option<Dav1dContext> = None;
-        // SAFETY: default_settings полностью инициализирует структуру; open пишет в ctx.
+        // SAFETY: default_settings fully initializes the struct; open writes to ctx.
         let r = unsafe {
             dav1d_default_settings(NonNull::new_unchecked(s.as_mut_ptr()));
             let s = s.as_mut_ptr();
-            // Обложка — фоновая картинка: пары потоков хватает, композитору нужнее CPU.
+            // The cover is a background image: a couple of threads is enough, the compositor needs the CPU more.
             (*s).n_threads = threads();
             (*s).max_frame_delay = 1;
             dav1d_open(Some(NonNull::from(&mut ctx)), NonNull::new(s))
@@ -55,7 +55,7 @@ impl Av1Decoder {
     fn drain(&mut self, out: &mut Vec<DecodedFrame>) -> PipeResult<()> {
         loop {
             let mut pic = Dav1dPicture::default();
-            // SAFETY: ctx открыт, pic — валидная пустая структура.
+            // SAFETY: ctx is open, pic is a valid empty struct.
             let r = unsafe { dav1d_get_picture(self.ctx, Some(NonNull::from(&mut pic))) };
             if r.0 == EAGAIN {
                 return Ok(());
@@ -64,7 +64,7 @@ impl Av1Decoder {
                 return Err(format!("dav1d_get_picture: {}", r.0));
             }
             let frame = convert(&pic);
-            // SAFETY: картинку отдал get_picture, отпускаем ровно один раз.
+            // SAFETY: the picture came from get_picture; release it exactly once.
             unsafe { dav1d_picture_unref(Some(NonNull::from(&mut pic))) };
             if let Some(f) = frame {
                 out.push(f);
@@ -88,7 +88,7 @@ fn convert(pic: &Dav1dPicture) -> Option<DecodedFrame> {
         _ => return None,
     };
     let (matrix, full_range) = match pic.seq_hdr {
-        // SAFETY: seq_hdr живёт, пока жива картинка.
+        // SAFETY: seq_hdr lives as long as the picture.
         Some(sh) => unsafe {
             let sh = sh.as_ref();
             let m = match sh.mtrx {
@@ -111,7 +111,7 @@ fn convert(pic: &Dav1dPicture) -> Option<DecodedFrame> {
     let cw = (w as usize).div_ceil(1 << sx);
     let ys = usize::try_from(pic.stride[0]).ok()?;
     let cs = usize::try_from(pic.stride[1]).ok()?;
-    // SAFETY: плоскости принадлежат картинке и имеют как минимум stride*(строк) байт.
+    // SAFETY: the planes belong to the picture and hold at least stride*(rows) bytes.
     let plane = |i: usize, stride: usize, width: usize, rows: usize| -> Option<Plane<'_>> {
         let p = pic.data[i]?;
         let len = stride * (rows - 1) + width * bpp;
@@ -157,18 +157,18 @@ impl Decoder for Av1Decoder {
             return Ok(out);
         }
         let mut data = Dav1dData::default();
-        // SAFETY: data_create выделяет буфер ровно на len байт; копируем пакет туда.
+        // SAFETY: data_create allocates exactly len bytes; we copy the packet into it.
         unsafe {
             let buf = dav1d_data_create(Some(NonNull::from(&mut data)), packet.data.len());
             if buf.is_null() {
-                return Err("dav1d_data_create: нет памяти".into());
+                return Err("dav1d_data_create: out of memory".into());
             }
             std::ptr::copy_nonoverlapping(packet.data.as_ptr(), buf, packet.data.len());
         }
         data.m.timestamp = i64::try_from(packet.pts.as_micros()).unwrap_or(i64::MAX);
 
         let res = loop {
-            // SAFETY: data создан выше; send_data сдвигает data/sz по мере поглощения.
+            // SAFETY: data was created above; send_data advances data/sz as it consumes input.
             let r: Dav1dResult =
                 unsafe { dav1d_send_data(self.ctx, Some(NonNull::from(&mut data))) };
             if r.0 < 0 && r.0 != EAGAIN {
@@ -181,7 +181,7 @@ impl Decoder for Av1Decoder {
                 break Ok(());
             }
         };
-        // SAFETY: если что-то осталось (ошибка) — отпускаем; пустые данные unref не трогает.
+        // SAFETY: if anything is left (on error), release it; unref ignores empty data.
         if data.sz > 0 {
             unsafe { dav1d_data_unref(Some(NonNull::from(&mut data))) };
         }
@@ -196,7 +196,7 @@ impl Decoder for Av1Decoder {
 
     fn reset(&mut self) {
         if let Some(c) = self.ctx {
-            // SAFETY: ctx открыт.
+            // SAFETY: ctx is open.
             unsafe { dav1d_flush(c) };
         }
     }
@@ -204,7 +204,7 @@ impl Decoder for Av1Decoder {
 
 impl Drop for Av1Decoder {
     fn drop(&mut self) {
-        // SAFETY: закрываем ровно один раз; close обнуляет ctx.
+        // SAFETY: closed exactly once; close zeroes ctx.
         unsafe { dav1d_close(Some(NonNull::from(&mut self.ctx))) };
     }
 }

@@ -1,10 +1,10 @@
-//! VP8 и VP9 на CPU: системный libvpx через dlopen.
+//! VP8 and VP9 on CPU: system libvpx via dlopen.
 //!
-//! Своя минимальная FFI по заголовкам libvpx (vpx_decoder.h, vpx_image.h):
-//! шесть функций и две структуры. ABI декодера у libvpx не менялся с 1.8
-//! (VPX_DECODER_ABI_VERSION = 12), soname при этом растёт — пробуем все.
-//! pts едет через `user_priv`: VP8/VP9 не переставляют кадры, но скрытые
-//! (altref) кадры картинки не дают, и метка остаётся за своим кадром.
+//! Our own minimal FFI based on the libvpx headers (vpx_decoder.h, vpx_image.h):
+//! six functions and two structs. The libvpx decoder ABI hasn't changed since 1.8
+//! (VPX_DECODER_ABI_VERSION = 12), but the soname keeps bumping, so we try them all.
+//! pts travels via `user_priv`: VP8/VP9 don't reorder frames, but hidden
+//! (altref) frames produce no picture, and the timestamp stays with its own frame.
 
 use std::ffi::{CStr, c_char, c_int, c_long, c_uint, c_void};
 use std::ptr::{null, null_mut};
@@ -98,39 +98,39 @@ struct Api {
     get_frame: FnGetFrame,
     destroy: FnDestroy,
     err_str: FnErrStr,
-    // держим библиотеку, пока живут указатели на её функции
+    // keep the library loaded while pointers to its functions are alive
     _lib: Library,
 }
 
 pub struct VpxDecoder {
     api: Api,
-    // Box: libvpx хранит указатель на контекст внутри себя, адрес не должен меняться
+    // Box: libvpx keeps a pointer to the context internally, so the address must not change
     ctx: Box<VpxCodecCtx>,
     vp9: bool,
 }
 
-// Контекст используется только из потока декодера.
+// The context is only used from the decoder thread.
 unsafe impl Send for VpxDecoder {}
 
 fn open_lib() -> Result<Library, String> {
     let mut tried = Vec::new();
     let explicit = std::env::var(ENV_PATH).ok();
-    // NSC_LIB_VPX — абсолютный путь, вшитый при сборке (Nix: библиотека из store,
-    // на NixOS dlopen по soname её не найдёт)
+    // NSC_LIB_VPX: absolute path baked in at build time (Nix: library from the store;
+    // on NixOS dlopen by soname won't find it)
     for name in explicit
         .iter()
         .map(String::as_str)
         .chain(option_env!("NSC_LIB_VPX"))
         .chain(CANDIDATES.iter().copied())
     {
-        // SAFETY: у libvpx нет конструкторов с побочными эффектами.
+        // SAFETY: libvpx has no constructors with side effects.
         match unsafe { Library::new(name) } {
             Ok(l) => return Ok(l),
             Err(e) => tried.push(format!("{name}: {e}")),
         }
     }
     Err(format!(
-        "libvpx не найден (поставьте пакет libvpx или задайте {ENV_PATH}); пробовал: {}",
+        "libvpx not found (install the libvpx package or set {ENV_PATH}); tried: {}",
         tried.join("; ")
     ))
 }
@@ -140,15 +140,15 @@ impl VpxDecoder {
         let vp9 = match codec {
             Codec::Vp8 => false,
             Codec::Vp9 => true,
-            other => return Err(format!("libvpx не декодирует {other:?}")),
+            other => return Err(format!("libvpx cannot decode {other:?}")),
         };
         let lib = open_lib()?;
-        // SAFETY: сигнатуры — из vpx_decoder.h / vp8dx.h.
+        // SAFETY: signatures are from vpx_decoder.h / vp8dx.h.
         let (iface, init, api) = unsafe {
             let sym = |n: &[u8]| -> Result<*const c_void, String> {
                 lib.get::<*const c_void>(n).map(|s| *s).map_err(|e| {
                     format!(
-                        "libvpx: нет {}: {e}",
+                        "libvpx: missing {}: {e}",
                         String::from_utf8_lossy(&n[..n.len() - 1])
                     )
                 })
@@ -175,7 +175,7 @@ impl VpxDecoder {
             (iface_fn(), init, api)
         };
         if iface.is_null() {
-            return Err("libvpx собран без декодера для этого кодека".into());
+            return Err("libvpx was built without a decoder for this codec".into());
         }
         let mut ctx = Box::new(VpxCodecCtx {
             name: null(),
@@ -192,7 +192,7 @@ impl VpxDecoder {
             w: 0,
             h: 0,
         };
-        // SAFETY: ctx — наш буфер нужного размера, cfg живёт весь вызов.
+        // SAFETY: ctx is our buffer of the right size; cfg outlives the call.
         let r = unsafe {
             init(
                 &raw mut *ctx,
@@ -211,7 +211,7 @@ impl VpxDecoder {
     fn drain(&mut self, out: &mut Vec<DecodedFrame>) {
         let mut iter: *const c_void = null();
         loop {
-            // SAFETY: контекст инициализирован; картинка живёт до следующего decode.
+            // SAFETY: the context is initialized; the image lives until the next decode.
             let img = unsafe { (self.api.get_frame)(&raw mut *self.ctx, &raw mut iter) };
             let Some(img) = (unsafe { img.as_ref() }) else {
                 break;
@@ -222,10 +222,10 @@ impl VpxDecoder {
 }
 
 fn err_text(api: &Api, code: c_int) -> String {
-    // SAFETY: err_to_string возвращает статическую строку.
+    // SAFETY: err_to_string returns a static string.
     let p = unsafe { (api.err_str)(code) };
     if p.is_null() {
-        return format!("код {code}");
+        return format!("code {code}");
     }
     unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
 }
@@ -249,7 +249,7 @@ fn convert(img: &VpxImage) -> Option<DecodedFrame> {
     let (cw, ch) = (w.div_ceil(1 << sx), h.div_ceil(1 << sy));
     let plane = |i: usize, width: usize, rows: usize| -> Option<Plane<'_>> {
         let stride = usize::try_from(img.stride[i]).ok()?;
-        // SAFETY: libvpx выделяет stride*строк байт на плоскость.
+        // SAFETY: libvpx allocates stride*rows bytes per plane.
         Some(Plane {
             data: unsafe {
                 std::slice::from_raw_parts(img.planes[i], stride * (rows - 1) + width * bpp)
@@ -297,21 +297,21 @@ impl Decoder for VpxDecoder {
         let Ok(len) = c_uint::try_from(packet.data.len()) else {
             return Ok(out);
         };
-        // pts в микросекундах прямо в указателе: libvpx его не разыменовывает
+        // pts in microseconds stored in the pointer itself: libvpx never dereferences it
         let tag = usize::try_from(packet.pts.as_micros()).unwrap_or(usize::MAX) as *mut c_void;
-        // SAFETY: пакет живёт весь вызов; deadline 0 = лучшее качество.
+        // SAFETY: the packet outlives the call; deadline 0 = best quality.
         let r = unsafe { (self.api.decode)(&raw mut *self.ctx, packet.data.as_ptr(), len, tag, 0) };
         if r == 0 {
             self.drain(&mut out);
         }
-        // битый кадр пропускаем: следующий ключевой всё починит
+        // skip a broken frame: the next keyframe fixes everything
         Ok(out)
     }
 
     fn flush(&mut self) -> PipeResult<Vec<DecodedFrame>> {
         let mut out = Vec::new();
-        // NULL-данные = конец потока, декодер отдаёт что держал
-        // SAFETY: так flush описан в vpx_decoder.h.
+        // NULL data = end of stream; the decoder returns whatever it was holding
+        // SAFETY: this is how vpx_decoder.h documents flush.
         let r = unsafe { (self.api.decode)(&raw mut *self.ctx, null(), 0, null_mut(), 0) };
         if r == 0 {
             self.drain(&mut out);
@@ -320,14 +320,14 @@ impl Decoder for VpxDecoder {
     }
 
     fn reset(&mut self) {
-        // VP8/VP9 начинают с ключевого кадра, который сбрасывает все ссылки.
+        // VP8/VP9 start with a keyframe, which resets all references.
         let _ = self.flush();
     }
 }
 
 impl Drop for VpxDecoder {
     fn drop(&mut self) {
-        // SAFETY: контекст инициализирован в new и уничтожается один раз.
+        // SAFETY: the context is initialized in new and destroyed exactly once.
         unsafe { (self.api.destroy)(&raw mut *self.ctx) };
     }
 }

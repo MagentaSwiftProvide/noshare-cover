@@ -1,4 +1,4 @@
-//! PNG и JPEG: декодируем один раз, дальше кадр не меняется.
+//! PNG and JPEG: decoded once, the frame never changes after that.
 
 use std::path::Path;
 use std::time::Instant;
@@ -20,7 +20,7 @@ impl StillSource {
             .into_rgba8();
         let (w, h) = img.dimensions();
         if w == 0 || h == 0 {
-            return Err(open_err(path, "пустая картинка"));
+            return Err(open_err(path, "empty image"));
         }
         let frame = Frame {
             generation: 1,
@@ -36,7 +36,7 @@ impl Source for StillSource {
     }
 
     fn poll(&mut self, _now: Instant) -> Result<Option<Frame>, MediaError> {
-        // отдаём кадр один раз: прослойка держит текстуру у себя
+        // hand out the frame once: the shim keeps the texture
         Ok(self.frame.take())
     }
 }

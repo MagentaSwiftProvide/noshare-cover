@@ -3,7 +3,7 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    # только для packages.hyprland-git; основной пакет собирается против Hyprland из nixpkgs
+    # only for packages.hyprland-git; the main package builds against Hyprland from nixpkgs
     hyprland = {
       url = "github:hyprwm/Hyprland";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -23,8 +23,8 @@
       ];
       forAll = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
 
-      # Плагин обязан собираться против тех же заголовков, что и запущенный
-      # Hyprland (иначе он откажется грузиться), поэтому hyprland — параметр.
+      # The plugin must be built against the same headers as the running
+      # Hyprland (otherwise it refuses to load), so hyprland is a parameter.
       mkNoshareCover =
         pkgs: hyprlandPkg:
         pkgs.hyprlandPlugins.mkHyprlandPlugin {
@@ -33,30 +33,30 @@
           version = "0.2.0";
           src = self;
 
-          # зависимости Rust из Cargo.lock, сеть в песочнице не нужна
+          # Rust deps from Cargo.lock, no network needed in the sandbox
           cargoDeps = pkgs.rustPlatform.importCargoLock { lockFile = ./Cargo.lock; };
           nativeBuildInputs = [
             pkgs.cargo
             pkgs.rustc
             pkgs.rustPlatform.cargoSetupHook
-            pkgs.nasm # asm-ядра rav1d (AV1 на CPU)
-            pkgs.rustPlatform.bindgenHook # cros-libva генерирует привязки к libva
+            pkgs.nasm # rav1d asm kernels (AV1 on CPU)
+            pkgs.rustPlatform.bindgenHook # cros-libva generates libva bindings
           ];
-          # только для VA-API помощника (vaapi-helper); в сам плагин не линкуются
+          # only for the VA-API helper (vaapi-helper); not linked into the plugin itself
           buildInputs = [
             pkgs.libva
             pkgs.libgbm
           ];
 
-          # openh264 и libvpx грузятся dlopen-ом; на NixOS по soname их не
-          # найти, поэтому вшиваем пути из store (без них плагин тоже работает,
-          # просто H.264/VP9 на CPU будут недоступны)
+          # openh264 and libvpx are dlopen-ed; on NixOS they can't be found by
+          # soname, so we embed store paths (the plugin works without them,
+          # just without H.264/VP9 on CPU)
           env = {
             NSC_LIB_OPENH264 = "${pkgs.openh264}/lib/libopenh264.so";
             NSC_LIB_VPX = "${pkgs.libvpx}/lib/libvpx.so";
           };
 
-          # локальный .so в дереве иначе make считает сборку готовой
+          # otherwise make treats a local .so in the tree as an up-to-date build
           preBuild = ''
             rm -f libnoshare-cover.so
           '';
@@ -78,20 +78,20 @@
     in
     {
       packages = forAll (pkgs: {
-        # Hyprland из nixpkgs — то, что ставит programs.hyprland.enable по умолчанию
+        # Hyprland from nixpkgs, what programs.hyprland.enable installs by default
         default = mkNoshareCover pkgs pkgs.hyprland;
-        # для тех, кто ставит Hyprland флейком hyprwm/Hyprland
+        # for those who install Hyprland from the hyprwm/Hyprland flake
         hyprland-git = mkNoshareCover pkgs hyprland.packages.${pkgs.stdenv.hostPlatform.system}.hyprland;
       });
 
-      # pkgs.hyprlandPlugins.noshare-cover против final.hyprland
+      # pkgs.hyprlandPlugins.noshare-cover against final.hyprland
       overlays.default = final: prev: {
         hyprlandPlugins = prev.hyprlandPlugins // {
           noshare-cover = mkNoshareCover final final.hyprland;
         };
       };
 
-      # своя сборка Hyprland: noshare-cover.lib.mkNoshareCover pkgs config.programs.hyprland.package
+      # custom Hyprland build: noshare-cover.lib.mkNoshareCover pkgs config.programs.hyprland.package
       lib = { inherit mkNoshareCover; };
 
       devShells = forAll (pkgs: {

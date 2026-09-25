@@ -1,6 +1,6 @@
-# noshare-cover для Arch: собирается против установленного Hyprland.
-# После обновления hyprland пакет надо пересобрать: плагин, собранный под
-# другие заголовки, откажется грузиться (проверка хеша), а не уронит композитор.
+# noshare-cover for Arch: built against the installed Hyprland.
+# Rebuild the package after updating hyprland: a plugin built against other
+# headers refuses to load (hash check) instead of crashing the compositor.
 pkgname=hyprland-noshare-cover-git
 pkgver=0.2.0
 pkgrel=1
@@ -11,14 +11,14 @@ license=('BSD-3-Clause')
 depends=('hyprland' 'gcc-libs' 'glibc')
 makedepends=('cargo' 'nasm' 'git' 'pkgconf' 'clang' 'libva' 'mesa')
 optdepends=(
-    'openh264: H.264 на CPU'
-    'libvpx: VP8/VP9 на CPU'
-    'libva: декод на GPU через VA-API (Intel, AMD)'
-    'nvidia-utils: декод на GPU через NVDEC (NVIDIA)'
+    'openh264: H.264 decoding on CPU'
+    'libvpx: VP8/VP9 decoding on CPU'
+    'libva: GPU decoding via VA-API (Intel, AMD)'
+    'nvidia-utils: GPU decoding via NVDEC (NVIDIA)'
 )
 provides=('hyprland-noshare-cover')
 conflicts=('hyprland-noshare-cover')
-# NSC_REPO — для сборки из локального клона: NSC_REPO=/path/to/repo makepkg
+# NSC_REPO: build from a local clone: NSC_REPO=/path/to/repo makepkg
 source=("noshare-cover::git+${NSC_REPO:-https://github.com/gitscout-bot/noshare-cover.git}")
 sha256sums=('SKIP')
 options=('!lto' '!debug')

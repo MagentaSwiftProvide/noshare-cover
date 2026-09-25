@@ -4,12 +4,12 @@ CARGO    ?= cargo
 
 RUST_LIB := target/release/libnoshare_cover.a
 RUST_SRC := Cargo.toml Cargo.lock build.rs $(shell find src -name '*.rs')
-# VA-API помощник: отдельная .so с libva/libgbm, вшивается в плагин (см.
-# src/media/video/decode/vaapi.rs). NSC_VAAPI=0 — собрать без VA-API
-# (тогда не нужны libva, clang и заголовки libva).
-# Всё нужное для сборки проверяется сразу, со списком того, чего не хватает,
-# вместо молчаливого "failed to build" в hyprpm. NSC_VAAPI=0 — собрать без
-# VA-API (тогда clang и libva не нужны).
+# VA-API helper: a separate .so with libva/libgbm, embedded into the plugin (see
+# src/media/video/decode/vaapi.rs). NSC_VAAPI=0 builds without VA-API
+# (then libva, clang and the libva headers aren't needed).
+# All build requirements are checked up front and missing ones are listed,
+# instead of a silent "failed to build" in hyprpm. NSC_VAAPI=0 builds without
+# VA-API (then clang and libva aren't needed).
 NSC_VAAPI ?= 1
 have = $(shell command -v $(1) >/dev/null 2>&1 && echo y)
 havepc = $(shell pkg-config --exists $(1) 2>/dev/null && echo y)
@@ -38,21 +38,21 @@ MISSING += gbm(pacman:mesa)
 endif
 endif
 ifneq ($(strip $(MISSING)),)
-$(error noshare-cover: для сборки не хватает: $(strip $(MISSING)). Arch: sudo pacman -S --needed rust pkgconf nasm clang libva mesa. Без VA-API: make NSC_VAAPI=0)
+$(error noshare-cover: missing build dependencies: $(strip $(MISSING)). Arch: sudo pacman -S --needed rust pkgconf nasm clang libva mesa. Without VA-API: make NSC_VAAPI=0)
 endif
 HELPER   := target/release/libnoshare_cover_vaapi.so
 HELPER_SRC := vaapi-helper/Cargo.toml $(shell find vaapi-helper/src vendor -name '*.rs')
 
-# Никакого ffmpeg/cairo/libjpeg/giflib: медиа целиком в Rust-ядре.
+# No ffmpeg/cairo/libjpeg/giflib: all media handling lives in the Rust core.
 PKGS     := hyprland pixman-1 libdrm wayland-server egl hyprutils hyprgraphics aquamarine hyprlang
 CXXFLAGS := -std=c++26 -shared -fPIC -fno-gnu-unique -O2 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers
 INCLUDES := $(shell pkg-config --cflags $(PKGS)) -Iinclude
-# Rust std на Linux: pthread, dl, m. VA-API/dav1d/openh264 добавятся с декодерами.
+# Rust std on Linux: pthread, dl, m. VA-API/dav1d/openh264 come with the decoders.
 LIBS     := -lpthread -ldl -lm
-# Rust-архив целиком скрытый (--exclude-libs): его символы не видны и не
-# пересекаются с другими плагинами. Сам плагин линкуется как обычный C++-плагин:
-# глобалы Hyprland (inline-переменные вроде g_pHyprRenderer) должны связаться
-# с копией в бинаре Hyprland, поэтому version script с `local: *` нельзя.
+# The whole Rust archive is hidden (--exclude-libs): its symbols aren't exported
+# and don't clash with other plugins. The plugin itself links like any C++ plugin:
+# Hyprland globals (inline variables like g_pHyprRenderer) must bind to the copy
+# in the Hyprland binary, so a version script with `local: *` is not an option.
 LDFLAGS  := -Wl,--exclude-libs,ALL -Wl,--gc-sections
 
 all: lib$(PLUGIN).so
@@ -78,7 +78,7 @@ install: all
 	install -Dm755 lib$(PLUGIN).so $(prefix)/lib/lib$(PLUGIN).so
 	ln -sfn lib$(PLUGIN).so $(prefix)/lib/$(PLUGIN).so
 
-# локальная копия, Nix этот таргет не вызывает
+# local copy; Nix never calls this target
 local: all
 	install -Dm755 lib$(PLUGIN).so $(HOME)/.config/hypr/plugins/$(PLUGIN).so
 

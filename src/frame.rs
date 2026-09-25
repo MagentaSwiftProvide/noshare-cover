@@ -1,8 +1,8 @@
-//! Готовый кадр: либо пиксели в памяти, либо dmabuf прямо из декодера GPU.
+//! A decoded frame: either pixels in memory or a dmabuf straight from the GPU decoder.
 //!
-//! Пиксели — premultiplied BGRA в памяти (= `DRM_FORMAT_ARGB8888` на little-endian),
-//! то есть ровно то, что Hyprland принимает в `createTexture(drmFormat, pixels, …)`
-//! без перепаковки. dmabuf уходит в `createTexture(SDMABUFAttrs)` — без копий через CPU.
+//! Pixels are premultiplied BGRA in memory (= `DRM_FORMAT_ARGB8888` on little-endian),
+//! which is exactly what Hyprland takes in `createTexture(drmFormat, pixels, …)`
+//! without repacking. A dmabuf goes to `createTexture(SDMABUFAttrs)` with no CPU copies.
 
 use std::sync::Arc;
 
@@ -11,8 +11,8 @@ pub const DRM_FORMAT_ARGB8888: u32 = u32::from_le_bytes(*b"AR24");
 
 #[derive(Debug, Clone)]
 pub struct Frame {
-    /// Растёт с каждым новым кадром источника. Прослойка обновляет текстуру,
-    /// только когда номер сменился.
+    /// Increments with every new source frame. The shim updates the texture
+    /// only when this number changes.
     pub generation: u64,
     pub data: FrameData,
 }
@@ -34,19 +34,19 @@ impl FrameData {
     }
 }
 
-/// Кадр в памяти. `Arc` — чтобы отдать указатель в C++ без копии и не бояться,
-/// что декодер перезапишет буфер, пока текстура из него грузится.
+/// A frame in memory. `Arc` lets us hand the pointer to C++ without a copy and
+/// without the decoder overwriting the buffer while a texture is uploaded from it.
 #[derive(Debug, Clone)]
 pub struct CpuFrame {
     pub width: u32,
     pub height: u32,
-    /// Байт на строку.
+    /// Bytes per row.
     pub stride: u32,
     pub pixels: Arc<[u8]>,
 }
 
 impl CpuFrame {
-    /// Из RGBA8 (как отдают декодеры картинок): premultiply + перестановка в BGRA.
+    /// From RGBA8 (as image decoders return it): premultiply + swizzle to BGRA.
     pub fn from_rgba(width: u32, height: u32, rgba: &[u8]) -> Self {
         debug_assert_eq!(rgba.len(), width as usize * height as usize * 4);
         let mut out = Vec::with_capacity(rgba.len());
@@ -61,7 +61,7 @@ impl CpuFrame {
         }
     }
 
-    /// Уже готовый BGRA-буфер (например, холст GIF). Без копии.
+    /// A ready BGRA buffer (e.g. the GIF canvas). No copy.
     pub fn from_bgra(width: u32, height: u32, pixels: Arc<[u8]>) -> Self {
         debug_assert_eq!(pixels.len(), width as usize * height as usize * 4);
         Self {
@@ -73,14 +73,14 @@ impl CpuFrame {
     }
 }
 
-/// `c * a / 255` с округлением, как в исходном плагине.
+/// `c * a / 255` with rounding, as in the original plugin.
 #[inline]
 pub fn premul(c: u8, a: u8) -> u8 {
     ((u32::from(c) * u32::from(a) + 127) / 255) as u8
 }
 
-/// Кадр в видеопамяти, экспортированный декодером (`vaExportSurfaceHandle`).
-/// Дескрипторы закрываются при drop — текстура Hyprland держит свою копию fd.
+/// A frame in video memory, exported by the decoder (`vaExportSurfaceHandle`).
+/// The fds are closed on drop; the Hyprland texture keeps its own copy.
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub struct DmaBufFrame {
@@ -105,7 +105,7 @@ mod tests {
 
     #[test]
     fn premultiply_and_swizzle() {
-        // полупрозрачный красный -> BGRA с премультиплаем
+        // semi-transparent red -> premultiplied BGRA
         let f = CpuFrame::from_rgba(1, 1, &[255, 0, 0, 128]);
         assert_eq!(&*f.pixels, &[0, 0, 128, 128]);
         assert_eq!(f.stride, 4);

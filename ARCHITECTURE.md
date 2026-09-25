@@ -1,96 +1,121 @@
-# Архитектура noshare-cover 0.2
+# noshare-cover 0.2 architecture
 
-## Почему не «чистый Rust»
+## Why not "pure Rust"
 
-Плагин Hyprland — это `.so` с C++ ABI конкретной сборки Hyprland. Чтобы рисовать в
-кадр скриншера, нужен хук на приватный метод `Screenshare::CScreenshareFrame::renderMonitor`
-и классы render pass (`CTexPassElement`, `CRectPassElement`), правила окон
-(`Desktop::Rule`), значения конфига (`Config::Values`). C-API для этого у Hyprland нет,
-а C++ ABI из Rust надёжно не вызвать (шаблоны `SP<>`, виртуальные классы, версия
-заголовков). Upstream-путь: **вся логика в Rust, тонкая C++-прослойка только там,
-где без C++ ABI нельзя.** Прослойка — один файл, ~350 строк, без логики медиа.
+A Hyprland plugin is a `.so` tied to the C++ ABI of one Hyprland build. Drawing into a
+screencopy frame needs a hook on the private method `Screenshare::CScreenshareFrame::renderMonitor`
+plus render pass classes (`CTexPassElement`, `CRectPassElement`), window/layer rules
+(`Desktop::Rule`) and config values (`Config::Values`). Hyprland has no C API for any of
+that, and its C++ ABI can't be called from Rust reliably (`SP<>` templates, virtual classes,
+header versions). So: **all logic lives in Rust, with a thin C++ layer only where the C++
+ABI is unavoidable.** The layer is a single file with no media logic.
 
 ```
                     ┌──────────────── Hyprland (C++) ───────────────────┐
   CScreenshareFrame │ renderMonitor ──hook──▶ shim/plugin.cpp           │
-                    │                         │ конфиг, правила окон,    │
-                    │                         │ геометрия, текстуры,     │
-                    │                         │ render pass               │
+                    │                         │ config, window/layer     │
+                    │                         │ rules, geometry,         │
+                    │                         │ textures, render pass    │
                     └─────────────────────────┼──────────────────────────┘
                                               │ C ABI (include/noshare_cover.h)
                     ┌─────────────────────────▼──────── Rust (src/) ─────┐
-                    │ ffi.rs      вход, guard от паник                    │
-                    │ registry.rs обложки: кэш, эпоха, ошибки, эвикция    │
-                    │ config.rs   настройки, правила окна, backend, GPU   │
+                    │ ffi.rs      entry points, panic guards              │
+                    │ registry.rs covers: cache, epoch, errors, eviction  │
+                    │ config.rs   settings, rule overrides, backend, GPU  │
                     │ media/      still (png/jpg) · gif · video           │
-                    │   video/    pipeline (demux→decode) · worker · backend│
-                    │ gpu.rs      выбор render node                       │
-                    │ frame.rs    кадр: BGRA-пиксели или dmabuf           │
-                    │ extra.rs    публичный API для других плагинов       │
+                    │   video/    demux → decode → YUV→BGRA · worker      │
+                    │ gpu.rs      render node selection                   │
+                    │ frame.rs    frame: BGRA pixels or dmabuf            │
+                    │ extra.rs    public API for other plugins            │
                     └────────────────────────────────────────────────────┘
 ```
 
-## Поток кадра скриншера
+The VA-API decoder is a separate small library, `vaapi-helper` (cros-codecs over libva).
+Its bytes are embedded into the plugin at build time and it is loaded from a memfd with
+dlopen the first time a GPU video is opened. libva/libgbm are dependencies of the helper
+only: without libva there is no VA-API, but the plugin still loads and uses the CPU.
 
-1. Hyprland рендерит кадр скриншера → наш хук → оригинал → `paintCovers`.
-2. Прослойка отдаёт ядру текущий конфиг (`nsc_set_settings`). Ядро сравнивает с прошлым;
-   изменился — закрывает все источники и поднимает эпоху, прослойка по эпохе чистит
-   текстуры.
-3. На каждое окно с `no_screen_share`: геометрия как у Hyprland, значения правил окна →
-   `nsc_resolve` → кадр. Одинаковые (файл, скорость, петля) делят один источник и одну
-   текстуру; источник опрашивается один раз за кадр, сколько бы окон его ни показывали.
-4. Кадр → текстура: пиксели через `createTexture(drmFormat, pixels, stride, size)` /
-   `ITexture::update`, dmabuf — через `createTexture(SDMABUFAttrs)` без копий через CPU.
-   Текстура обновляется, только когда сменился `generation`.
-5. Прямоугольники других плагинов — чёрным или обложкой окна по его адресу.
-6. `nsc_end_frame`: обложки, которые 30 с никто не показывал, закрываются (для видео —
-   остановка потока). Раз в 120 кадров прослойка чистит текстуры мёртвых обложек.
+## A screencopy frame
 
-## Видео
+1. Hyprland renders a screencopy frame → our hook → the original → `paintCovers`.
+2. The layer hands the current config to the core (`nsc_set_settings`, also on every config
+   reload). If it changed, the core closes all sources and bumps the epoch; the layer then
+   drops its textures. The default cover is opened right away so the first capture already
+   has a frame.
+3. For every window and layer with `no_screen_share`: geometry as Hyprland computes it,
+   rule overrides → `nsc_resolve` → frame. Covers with the same (file, speed, loop) share one
+   source and one texture; a source is polled once per frame however many windows show it.
+4. Frame → texture: pixels via `createTexture(drmFormat, pixels, stride, size)` /
+   `ITexture::update`, dmabuf via `createTexture(SDMABUFAttrs)`. The texture is only updated
+   when `generation` changes.
+5. Rectangles from other plugins (gloview's overview tiles) get black or the window's cover.
+6. `nsc_end_frame`: covers nobody showed for 30 s are closed (for video that stops the
+   thread). Every 120 frames the layer drops textures of dead covers.
+7. While a monitor is being shared and shows an animated cover, a timer damages the cover
+   boxes at ~60 Hz. Hyprland only produces capture frames when the monitor repaints, so a
+   video cover would otherwise stall on a static monitor.
 
-Поток на источник. Наружу — только последний готовый кадр (без очереди, без роста памяти).
-Поток спит, если кадры не спрашивают 400 мс (нет скриншера) — после пробуждения часы
-стартуют с текущего кадра, а не догоняют. Опоздавший > 80 мс кадр выбрасывается.
-`Drop` источника = `quit` + `notify` + `join`: выгрузка плагина не оставляет потоков.
-Паника декодера ловится в потоке и превращается в ошибку для пользователя.
+## Video
 
-Бэкенд (`backend` в конфиге): `auto` — VA-API, если есть GPU и кодек поддерживается,
-иначе CPU; `gpu` — только VA-API, без тихого отката; `cpu` — только программный.
-`gpu_device` — явный render node, иначе первый `/dev/dri/renderD*`. Каждый отказ
-объясняется текстом, который видит пользователь.
+One thread per source. Only the latest decoded frame is exposed (no queue, no memory
+growth). The thread sleeps when nobody asks for frames for 400 ms; after waking up the
+clock restarts from the current frame instead of catching up. Frames more than 80 ms late
+are dropped. The first poll of a new source waits up to 120 ms for its first frame.
+Dropping a source = `quit` + `notify` + `join`: unloading the plugin leaves no threads.
+A decoder panic is caught in the thread and reported as an error.
 
-## Жизненный цикл и безопасность
+Backend (`backend` in the config): `auto` tries the GPU (NVDEC on NVIDIA render nodes, then
+VA-API) and falls back to the CPU; `gpu` never falls back; `cpu` is software only.
+`gpu_device` pins a render node, otherwise the first `/dev/dri/renderD*` is used. Every
+refusal is explained in a message the user sees.
 
-- Ни одна паника не выходит в Hyprland: все `extern "C"` под `catch_unwind`.
-- `PLUGIN_EXIT`: сначала снимаем хук (Hyprland чистит хуки уже *после* EXIT), потом
-  текстуры, потом `nsc_shutdown` (join всех потоков), потом эффекты правил и конфиг.
-- Rust-архив линкуется скрытым (`--exclude-libs,ALL`), публичный API выставляют обёртки в `shim/plugin.cpp`; весь Rust
-  скрыт.
-- `-fno-gnu-unique`: без него glibc помечает `.so` как NODELETE и reload молча грузит
-  старый образ (подробно — в CLAUDE.md gloview).
-- Раскладка структур C ABI закреплена числами с обеих сторон (`static_assert` в заголовке,
-  тест `ffi::tests::abi_layout`).
+YUV → BGRA runs on the worker thread, split across up to 4 threads for frames of ~1 MP and up.
+
+## Coexisting with other plugins
+
+Hyprland's function hooks are exclusive: two plugins can't hook `renderMonitor` at once.
+gloview hooks it itself while noshare-cover isn't loaded. If the hook is taken when
+noshare-cover loads, noshare-cover keeps retrying instead of refusing to load; gloview
+re-checks after every config reload (Hyprland reloads after each plugin load/unload),
+lets go of the hook and switches to noshare-cover's API. On unload noshare-cover removes
+its hook first and then calls API clients' gone callbacks, so gloview can take the hook
+back and never has to keep a dlopen handle that would pin noshare-cover in memory.
+
+## Lifecycle and safety
+
+- No panic reaches Hyprland: every `extern "C"` entry is wrapped in `catch_unwind`.
+- `PLUGIN_EXIT`: stop timers, remove the hook first (Hyprland removes hooks only *after*
+  EXIT), notify API clients, drop textures, `nsc_shutdown` (joins all threads), then rule
+  effects and config values.
+- The Rust archive is linked hidden (`--exclude-libs,ALL`); the public API is exported by
+  thin wrappers in `shim/plugin.cpp`. Do not use a version script with `local: *`: it also
+  localizes Hyprland's inline globals (`g_pHyprRenderer` & co) and the plugin ends up with
+  its own null copies.
+- `-fno-gnu-unique`: without it glibc marks the `.so` NODELETE and a reload silently gets
+  the old image.
+- On load the plugin compares `__hyprland_api_get_hash()` with the headers it was built
+  against and refuses to load on mismatch instead of crashing the compositor.
+- C ABI struct layouts are pinned by numbers on both sides (`static_assert` in the header,
+  the `ffi::tests::abi_layout` test).
 
 ## Status
 
-| Часть | Состояние |
+| Part | State |
 |---|---|
-| Конфиг, правила окна (плоские Lua-поля), `backend`, `gpu_device` | ✅ тесты + живой Hyprland |
-| PNG / JPEG / GIF | ✅ тесты + живой Hyprland |
-| Демуксеры MP4/MOV, WebM/MKV | ✅ тесты на настоящих файлах |
-| CPU: AV1 (rav1d), H.264 (openh264), VP8/VP9 (libvpx), YUV→BGRA | ✅ тесты на настоящих файлах + живой Hyprland |
-| NVDEC (dlopen, парсер драйвера, копия NV12/P016) | ⚠️ собрано, раскладка структур сверена с ffnvcodec-headers; на GPU не запускалось |
-| VA-API (vaapi-helper на cros-codecs, вшит, грузится из memfd) | ⚠️ собрано, загрузка помощника проверена; на GPU не запускалось; только 8 бит |
-| Прослойка `shim/plugin.cpp` (0.56.x и main) | ✅ собирается против 0.56.0/0.56.2, работает на 0.56.2 |
-| Выгрузка/загрузка, утечки | ✅ `tests/e2e/run.sh`: 8 циклов, потоки и RSS стабильны |
-| Упаковка: hyprpm, Arch PKGBUILD, Nix flake | ✅ makepkg и nix build (0.56.0, 0.56.2) |
+| Config, window and layer rules (flat Lua fields), `backend`, `gpu_device` | ✅ tests + live Hyprland |
+| PNG / JPEG / GIF | ✅ tests + live Hyprland |
+| MP4/MOV, WebM/MKV demuxers | ✅ tests on real files |
+| CPU: AV1 (rav1d), H.264 (openh264), VP8/VP9 (libvpx), YUV→BGRA | ✅ tests on real files + live Hyprland |
+| NVDEC (dlopen, driver parser, NV12/P016 copy) | ⚠️ builds, struct layouts checked against ffnvcodec-headers; not run on a GPU |
+| VA-API (vaapi-helper on cros-codecs, embedded, loaded from memfd) | ⚠️ builds, helper loading checked; not run on a GPU; 8-bit only |
+| `shim/plugin.cpp` (0.56.x and main) | ✅ builds against 0.56.0/0.56.2, runs on 0.56.2 |
+| Together with gloview | ✅ `tests/e2e/with-gloview.sh`: both load orders, unload/reload, overview tiles |
+| Unload/load, leaks | ✅ `tests/e2e/run.sh`: 8 cycles, threads and RSS stable |
+| Packaging: hyprpm, Arch PKGBUILD, Nix flake | ✅ makepkg and nix build (0.56.0, 0.56.2) |
 
-## Что проверять на реальной машине
+## What to check on a real machine
 
-- сборка через `make` и через `hyprpm` против запущенного Hyprland;
-- обложки на окнах в скриншере: картинка, GIF, видео; правила окна; смена конфига на лету;
-- `hyprctl plugin unload/load` много раз подряд: число сегментов `.so` в
-  `/proc/$(pidof Hyprland)/maps` падает до 0 после unload, потоков `noshare-video` нет;
-- долгий прогон видео (часы): RSS Hyprland и число fd стабильны;
-- смена медиа на лету, удаление/появление файла, битый файл;
-- VA-API на Intel/AMD, `backend = cpu` без GPU, `gpu_device` на машине с двумя GPU.
+- NVDEC on NVIDIA and VA-API on Intel/AMD (`backend = "gpu"`, `NOSHARE_COVER_DEBUG`);
+- long video runs (hours): Hyprland RSS and fd count stay flat;
+- two GPUs with `gpu_device`;
+- portal-based capture (OBS, Discord) on a static monitor while working on another one.

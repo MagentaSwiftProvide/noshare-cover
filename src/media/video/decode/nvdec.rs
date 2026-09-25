@@ -1,14 +1,14 @@
-//! NVIDIA: NVDEC напрямую, через libcuda + libnvcuvid из драйвера (dlopen).
+//! NVIDIA: NVDEC directly, via the driver's libcuda + libnvcuvid (dlopen).
 //!
-//! Разбор битстрима делает встроенный парсер драйвера (cuvidCreateVideoParser):
-//! он сам ведёт DPB, порядок показа и метки времени. Мы только отдаём ему
-//! пакеты, создаём декодер под формат потока и забираем готовые кадры.
-//! Кадр копируется из видеопамяти в NV12/P016 одним cuMemcpy2D и дальше идёт
-//! общим путём YUV → BGRA. Для обложки размером с окно это дешевле и надёжнее,
-//! чем CUDA↔EGL interop внутри композитора.
+//! Bitstream parsing is done by the driver's built-in parser (cuvidCreateVideoParser):
+//! it manages the DPB, display order and timestamps itself. We just feed it
+//! packets, create a decoder for the stream format and collect finished frames.
+//! A frame is copied from video memory as NV12/P016 with a single cuMemcpy2D and
+//! then goes through the common YUV → BGRA path. For a window-sized cover this is
+//! cheaper and more reliable than CUDA↔EGL interop inside the compositor.
 //!
-//! Ничего не линкуется: нет драйвера NVIDIA — `new()` вернёт ошибку, и
-//! backend.rs перейдёт к VA-API или CPU.
+//! Nothing is linked: without the NVIDIA driver `new()` returns an error and
+//! backend.rs falls back to VA-API or CPU.
 
 use std::ffi::{CStr, c_char, c_int, c_longlong, c_short, c_uint, c_ulong, c_void};
 use std::path::Path;
@@ -52,7 +52,7 @@ const PKT_TIMESTAMP: c_ulong = 0x02;
 const MEM_HOST: c_int = 1;
 const MEM_DEVICE: c_int = 2;
 
-/// Метки времени в микросекундах — как у нас в Packet.
+/// Timestamps in microseconds, same as our Packet.
 const CLOCK_RATE: c_uint = 1_000_000;
 
 #[repr(C)]
@@ -260,7 +260,7 @@ struct Cuvid {
 
 unsafe fn sym<T: Copy>(lib: &Library, name: &str) -> Result<T, String> {
     let cname = format!("{name}\0");
-    // SAFETY: тип T задаёт вызывающий по заголовку NVIDIA.
+    // SAFETY: the caller picks T according to the NVIDIA header.
     unsafe { lib.get::<T>(cname.as_bytes()) }
         .map(|s| *s)
         .map_err(|e| format!("{name}: {e}"))
@@ -269,7 +269,7 @@ unsafe fn sym<T: Copy>(lib: &Library, name: &str) -> Result<T, String> {
 fn open_any(names: &[&str]) -> Result<Library, String> {
     let mut errs = Vec::new();
     for n in names {
-        // SAFETY: библиотеки драйвера NVIDIA, конструкторы без побочных эффектов.
+        // SAFETY: NVIDIA driver libraries; constructors have no side effects.
         match unsafe { Library::new(n) } {
             Ok(l) => return Ok(l),
             Err(e) => errs.push(format!("{n}: {e}")),
@@ -285,8 +285,8 @@ impl Cuda {
             "libcuda.so",
             "/run/opengl-driver/lib/libcuda.so.1",
         ])
-        .map_err(|e| format!("нет драйвера NVIDIA ({e})"))?;
-        // SAFETY: имена и сигнатуры — из dynlink_cuda.h (nv-codec-headers).
+        .map_err(|e| format!("NVIDIA driver not found ({e})"))?;
+        // SAFETY: names and signatures come from dynlink_cuda.h (nv-codec-headers).
         unsafe {
             Ok(Self {
                 init: sym(&lib, "cuInit")?,
@@ -309,12 +309,12 @@ impl Cuda {
             return Ok(());
         }
         let mut s: *const c_char = null();
-        // SAFETY: cuGetErrorString пишет указатель на статическую строку.
+        // SAFETY: cuGetErrorString writes a pointer to a static string.
         let text = unsafe {
             if (self.get_error_string)(r, &raw mut s) == 0 && !s.is_null() {
                 CStr::from_ptr(s).to_string_lossy().into_owned()
             } else {
-                format!("код {r}")
+                format!("code {r}")
             }
         };
         Err(format!("{what}: {text}"))
@@ -328,8 +328,8 @@ impl Cuvid {
             "libnvcuvid.so",
             "/run/opengl-driver/lib/libnvcuvid.so.1",
         ])
-        .map_err(|e| format!("нет libnvcuvid ({e})"))?;
-        // SAFETY: имена и сигнатуры — из dynlink_cuviddec.h / dynlink_nvcuvid.h.
+        .map_err(|e| format!("libnvcuvid not found ({e})"))?;
+        // SAFETY: names and signatures come from dynlink_cuviddec.h / dynlink_nvcuvid.h.
         unsafe {
             Ok(Self {
                 get_decoder_caps: sym(&lib, "cuvidGetDecoderCaps")?,
@@ -349,14 +349,14 @@ impl Cuvid {
     }
 }
 
-/// Всё, что трогают колбэки парсера. Живёт в Box: парсер держит сырой указатель.
+/// Everything the parser callbacks touch. Lives in a Box: the parser holds a raw pointer.
 struct State {
     cuda: Cuda,
     cuvid: Cuvid,
     ctx: CuContext,
     lock: CuVideoCtxLock,
     decoder: CuVideoDecoder,
-    /// формат, под который создан decoder
+    /// format the decoder was created for
     fmt: Option<VideoFormat>,
     out_w: u32,
     out_h: u32,
@@ -364,7 +364,7 @@ struct State {
     high_depth: bool,
     ready: Vec<DecodedFrame>,
     error: Option<String>,
-    /// буфер под NV12/P016 из видеопамяти, переиспользуется между кадрами
+    /// buffer for NV12/P016 from video memory, reused across frames
     host: Vec<u8>,
 }
 
@@ -374,8 +374,8 @@ pub struct NvdecDecoder {
     codec: c_int,
 }
 
-// Всё используется только из потока декодера; CUDA-контекст явно
-// делается текущим на время каждого вызова.
+// Everything is used only from the decoder thread; the CUDA context is
+// explicitly made current for the duration of each call.
 unsafe impl Send for NvdecDecoder {}
 
 fn cuda_codec(codec: &Codec) -> Option<c_int> {
@@ -389,14 +389,14 @@ fn cuda_codec(codec: &Codec) -> Option<c_int> {
     })
 }
 
-/// PCI-адрес устройства за render node: /sys/class/drm/renderD128/device → 0000:01:00.0
+/// PCI address of the device behind a render node: /sys/class/drm/renderD128/device → 0000:01:00.0
 fn pci_of_node(node: &Path) -> Option<String> {
     let name = node.file_name()?;
     let dev = std::fs::read_link(Path::new("/sys/class/drm").join(name).join("device")).ok()?;
     Some(dev.file_name()?.to_string_lossy().to_ascii_lowercase())
 }
 
-/// Совпадает ли render node с устройством NVIDIA (vendor 0x10de).
+/// Whether the render node belongs to an NVIDIA device (vendor 0x10de).
 pub fn node_is_nvidia(node: &Path) -> bool {
     node.file_name()
         .and_then(|n| {
@@ -407,16 +407,16 @@ pub fn node_is_nvidia(node: &Path) -> bool {
 
 impl NvdecDecoder {
     pub fn new(codec: &Codec, node: Option<&Path>) -> PipeResult<Self> {
-        let cc = cuda_codec(codec).ok_or_else(|| format!("NVDEC не умеет {codec:?}"))?;
+        let cc = cuda_codec(codec).ok_or_else(|| format!("NVDEC doesn't support {codec:?}"))?;
         let cuda = Cuda::load()?;
         let cuvid = Cuvid::load()?;
-        // SAFETY: последовательность инициализации из NVDEC Programming Guide.
+        // SAFETY: initialization sequence from the NVDEC Programming Guide.
         unsafe {
             cuda.check("cuInit", (cuda.init)(0))?;
             let dev = pick_device(&cuda, node)?;
             let mut ctx: CuContext = null_mut();
             cuda.check("cuCtxCreate", (cuda.ctx_create)(&raw mut ctx, 0, dev))?;
-            // cuCtxCreate делает контекст текущим — сразу снимаем, дальше push/pop
+            // cuCtxCreate makes the context current; pop it right away and use push/pop from here on
             let mut prev: CuContext = null_mut();
             (cuda.ctx_pop)(&raw mut prev);
 
@@ -451,9 +451,7 @@ impl NvdecDecoder {
                 Ok(true) => {}
                 Ok(false) => {
                     state.destroy();
-                    return Err(format!(
-                        "эта видеокарта не декодирует {codec:?} через NVDEC"
-                    ));
+                    return Err(format!("this GPU can't decode {codec:?} via NVDEC"));
                 }
                 Err(e) => {
                     state.destroy();
@@ -478,7 +476,7 @@ impl NvdecDecoder {
     fn new_parser(&mut self) -> PipeResult<()> {
         let mut p = ParserParams {
             codec_type: self.codec,
-            max_num_decode_surfaces: 1, // уточнит колбэк последовательности
+            max_num_decode_surfaces: 1, // the sequence callback will adjust it
             clock_rate: CLOCK_RATE,
             error_threshold: 100,
             max_display_delay: 0,
@@ -493,14 +491,14 @@ impl NvdecDecoder {
             reserved2: [null_mut(); 5],
             ext_video_info: null_mut(),
         };
-        // SAFETY: p живёт весь вызов; user_data — Box, адрес стабилен.
+        // SAFETY: p outlives the call; user_data is a Box, so its address is stable.
         let r = unsafe { (self.state.cuvid.create_parser)(&raw mut self.parser, &raw mut p) };
         self.state.cuda.check("cuvidCreateVideoParser", r)
     }
 
     fn drop_parser(&mut self) {
         if !self.parser.is_null() {
-            // SAFETY: парсер создан нами и уничтожается один раз.
+            // SAFETY: we created the parser and destroy it exactly once.
             unsafe { (self.state.cuvid.destroy_parser)(self.parser) };
             self.parser = null_mut();
         }
@@ -523,9 +521,9 @@ impl NvdecDecoder {
             timestamp: c_longlong::try_from(pts.as_micros()).unwrap_or(c_longlong::MAX),
         };
         let parser = self.parser;
-        // колбэки зовутся синхронно внутри parse и пишут в state
+        // callbacks are invoked synchronously inside parse and write into state
         let r = self.state.with_ctx(|s| {
-            // SAFETY: парсер жив, пакет живёт весь вызов.
+            // SAFETY: the parser is alive; the packet outlives the call.
             s.cuda.check("cuvidParseVideoData", unsafe {
                 (s.cuvid.parse)(parser, &raw mut pkt)
             })
@@ -540,47 +538,47 @@ impl NvdecDecoder {
 
 fn pick_device(cuda: &Cuda, node: Option<&Path>) -> Result<CuDevice, String> {
     let mut count = 0;
-    // SAFETY: cuInit уже вызван.
+    // SAFETY: cuInit has already been called.
     cuda.check("cuDeviceGetCount", unsafe {
         (cuda.device_get_count)(&raw mut count)
     })?;
     if count <= 0 {
-        return Err("CUDA не видит ни одной видеокарты".into());
+        return Err("CUDA sees no GPUs".into());
     }
     let want = node.and_then(pci_of_node);
     for i in 0..count {
         let mut dev = 0;
-        // SAFETY: индекс в пределах count.
+        // SAFETY: the index is within count.
         cuda.check("cuDeviceGet", unsafe { (cuda.device_get)(&raw mut dev, i) })?;
         let Some(want) = &want else { return Ok(dev) };
         let mut buf = [0 as c_char; 32];
-        // SAFETY: буфер на 32 байта, функция пишет C-строку не длиннее len.
+        // SAFETY: 32-byte buffer; the function writes a C string no longer than len.
         if unsafe { (cuda.device_get_pci_bus_id)(buf.as_mut_ptr(), buf.len() as c_int, dev) } == 0 {
             let id = unsafe { CStr::from_ptr(buf.as_ptr()) }
                 .to_string_lossy()
                 .to_ascii_lowercase();
-            // CUDA пишет домен 8 знаками (00000000:01:00.0), sysfs — 4
+            // CUDA writes the domain with 8 digits (00000000:01:00.0), sysfs with 4
             if id.ends_with(want.as_str()) || want.ends_with(id.trim_start_matches('0')) {
                 return Ok(dev);
             }
         }
     }
     Err(format!(
-        "{} — не устройство NVIDIA/CUDA",
+        "{} is not an NVIDIA/CUDA device",
         node.map_or_else(String::new, |n| n.display().to_string())
     ))
 }
 
 impl State {
-    /// Сделать наш CUDA-контекст текущим на время `f`.
+    /// Make our CUDA context current for the duration of `f`.
     fn with_ctx<R>(&mut self, f: impl FnOnce(&mut Self) -> Result<R, String>) -> Result<R, String> {
-        // SAFETY: ctx создан нами и ещё жив.
+        // SAFETY: we created ctx and it is still alive.
         self.cuda.check("cuCtxPushCurrent", unsafe {
             (self.cuda.ctx_push)(self.ctx)
         })?;
         let r = f(self);
         let mut prev: CuContext = null_mut();
-        // SAFETY: снимаем ровно то, что положили.
+        // SAFETY: pops exactly what we pushed.
         unsafe { (self.cuda.ctx_pop)(&raw mut prev) };
         r
     }
@@ -588,7 +586,7 @@ impl State {
     fn destroy_decoder(&mut self) {
         if !self.decoder.is_null() {
             let dec = self.decoder;
-            // SAFETY: декодер создан нами.
+            // SAFETY: we created the decoder.
             let _ = self.with_ctx(|s| {
                 unsafe { (s.cuvid.destroy_decoder)(dec) };
                 Ok(())
@@ -600,7 +598,7 @@ impl State {
 
     fn destroy(&mut self) {
         self.destroy_decoder();
-        // SAFETY: освобождаем в обратном порядке создания, каждое один раз.
+        // SAFETY: released in reverse creation order, each exactly once.
         unsafe {
             if !self.lock.is_null() {
                 (self.cuvid.ctx_lock_destroy)(self.lock);
@@ -624,7 +622,7 @@ impl State {
             return Ok(surfaces);
         }
         if f.chroma_format != CHROMA_420 && f.chroma_format != CHROMA_MONO {
-            return Err("NVDEC-путь плагина поддерживает только 4:2:0".into());
+            return Err("the plugin's NVDEC path supports 4:2:0 only".into());
         }
         self.destroy_decoder();
 
@@ -666,7 +664,7 @@ impl State {
             reserved2: [0; 3],
         };
         let mut dec: CuVideoDecoder = null_mut();
-        // SAFETY: колбэк зовётся внутри parse, контекст уже текущий.
+        // SAFETY: the callback runs inside parse; the context is already current.
         self.cuda.check("cuvidCreateDecoder", unsafe {
             (self.cuvid.create_decoder)(&raw mut dec, &raw mut info)
         })?;
@@ -700,7 +698,7 @@ impl State {
         };
         let mut dptr: u64 = 0;
         let mut pitch: c_uint = 0;
-        // SAFETY: индекс картинки пришёл от парсера; контекст текущий.
+        // SAFETY: the picture index comes from the parser; the context is current.
         self.cuda.check("cuvidMapVideoFrame", unsafe {
             (self.cuvid.map_frame)(
                 self.decoder,
@@ -716,7 +714,7 @@ impl State {
         let row = w * bpp;
         let ch = h.div_ceil(2);
         self.host.resize(row * (h + ch), 0);
-        // Y, затем UV: в видеопамяти UV лежит сразу после surface_h строк яркости
+        // Y, then UV: in video memory UV immediately follows surface_h luma rows
         let chroma_off = u64::from(pitch) * u64::from((self.surface_h + 1) & !1);
         let copies = [(dptr, 0usize, h), (dptr + chroma_off, row * h, ch)];
         let mut res = Ok(());
@@ -732,7 +730,7 @@ impl State {
                 dst_x_in_bytes: 0,
                 dst_y: 0,
                 dst_memory_type: MEM_HOST,
-                // SAFETY: host вмещает row*(h+ch) байт.
+                // SAFETY: host holds row*(h+ch) bytes.
                 dst_host: unsafe { self.host.as_mut_ptr().add(off) }.cast(),
                 dst_device: 0,
                 dst_array: null_mut(),
@@ -740,7 +738,7 @@ impl State {
                 width_in_bytes: row,
                 height: rows,
             };
-            // SAFETY: m полностью заполнен, источник — отображённый кадр.
+            // SAFETY: m is fully initialized; the source is the mapped frame.
             res = self
                 .cuda
                 .check("cuMemcpy2D", unsafe { (self.cuda.memcpy2d)(&raw const m) });
@@ -748,11 +746,11 @@ impl State {
                 break;
             }
         }
-        // SAFETY: отображали выше, отпускаем сразу после копии.
+        // SAFETY: mapped above; unmapped right after the copy.
         unsafe { (self.cuvid.unmap_frame)(self.decoder, dptr) };
         res?;
 
-        let fmt = self.fmt.as_ref().ok_or("кадр без формата")?;
+        let fmt = self.fmt.as_ref().ok_or("frame without a format")?;
         let vsd = fmt.video_signal_description;
         let matrix = match vsd[3] {
             1 => Matrix::Bt709,
@@ -764,7 +762,7 @@ impl State {
         let img = YuvImage {
             width: self.out_w,
             height: self.out_h,
-            // P016: 10/12 бит лежат в старших битах 16-битного слова
+            // P016: 10/12-bit samples sit in the high bits of a 16-bit word
             bit_depth: if self.high_depth { 16 } else { 8 },
             chroma: if fmt.chroma_format == CHROMA_MONO {
                 Chroma::Mono
@@ -792,16 +790,16 @@ impl State {
     }
 }
 
-// Колбэки парсера: ошибки складываем в state.error и возвращаем 0 — парсер
-// прервёт cuvidParseVideoData, а feed() отдаст текст ошибки наверх.
-// Паника через C-границу недопустима, поэтому всё внутри catch_unwind.
+// Parser callbacks: errors go into state.error and we return 0, so the parser
+// aborts cuvidParseVideoData and feed() passes the error text up.
+// A panic must not cross the C boundary, so everything runs inside catch_unwind.
 fn callback<T>(
     user: *mut c_void,
     arg: *mut T,
     f: impl FnOnce(&mut State, &T) -> Result<c_int, String>,
 ) -> c_int {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // SAFETY: user — наш Box<State>, arg — структура от парсера на время вызова.
+        // SAFETY: user is our Box<State>; arg is a parser struct valid for the duration of the call.
         let (Some(state), Some(arg)) = (unsafe { user.cast::<State>().as_mut() }, unsafe {
             arg.as_ref()
         }) else {
@@ -824,7 +822,7 @@ unsafe extern "C" fn on_sequence(user: *mut c_void, f: *mut VideoFormat) -> c_in
 
 unsafe extern "C" fn on_decode(user: *mut c_void, pic: *mut c_void) -> c_int {
     std::panic::catch_unwind(|| {
-        // SAFETY: user — наш State; pic передаём драйверу как есть.
+        // SAFETY: user is our State; pic is passed to the driver as is.
         let Some(s) = (unsafe { user.cast::<State>().as_mut() }) else {
             return 0;
         };
@@ -846,7 +844,7 @@ unsafe extern "C" fn on_decode(user: *mut c_void, pic: *mut c_void) -> c_int {
 
 unsafe extern "C" fn on_display(user: *mut c_void, d: *mut ParserDispInfo) -> c_int {
     if d.is_null() {
-        return 1; // конец потока (CUVID_PKT_NOTIFY_EOS)
+        return 1; // end of stream (CUVID_PKT_NOTIFY_EOS)
     }
     callback(user, d, |s, d| s.display(d).map(|()| 1))
 }
@@ -865,7 +863,7 @@ impl Decoder for NvdecDecoder {
 
     fn flush(&mut self) -> PipeResult<Vec<DecodedFrame>> {
         let out = self.feed(&[], PKT_ENDOFSTREAM, Duration::ZERO);
-        // после конца потока парсер новые данные не принимает — нужен свежий
+        // after end of stream the parser accepts no new data, so we need a fresh one
         self.drop_parser();
         self.new_parser()?;
         out
@@ -893,7 +891,7 @@ mod tests {
     use super::*;
     use std::mem::{offset_of, size_of};
 
-    /// Раскладка структур против nv-codec-headers на Linux x86_64 (LP64).
+    /// Struct layouts checked against nv-codec-headers on Linux x86_64 (LP64).
     #[test]
     #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
     fn layouts_match_nv_codec_headers() {
@@ -911,7 +909,7 @@ mod tests {
         assert_eq!(size_of::<Memcpy2D>(), 128);
     }
 
-    /// То, что не зависит от размера long, проверяем везде.
+    /// Whatever doesn't depend on the size of long is checked everywhere.
     #[test]
     fn portable_layouts() {
         assert_eq!(size_of::<VideoFormat>(), 64);
@@ -934,7 +932,7 @@ mod tests {
 
     #[test]
     fn no_driver_is_an_error_not_a_crash() {
-        // на машине без NVIDIA (CI, Windows) — внятная ошибка, а не паника
+        // on a machine without NVIDIA (CI, Windows): a clear error, not a panic
         if open_any(&["libcuda.so.1"]).is_ok() {
             return;
         }

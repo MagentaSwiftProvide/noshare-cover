@@ -42,41 +42,41 @@ load() { hctl plugin load "$1" >/dev/null; hctl reload >/dev/null; sleep 1.5; }
 unload() { hctl plugin unload "$1" >/dev/null; hctl reload >/dev/null; sleep 1.5; }
 check_cover() { # label
     local c; c=$(win_is_cover); read -r r g b <<<"$c"
-    [ "$r" -gt 200 ] && [ "$g" -lt 60 ] && [ "$b" -gt 200 ] && pass "$1: окно в захвате закрыто обложкой" || fail "$1: в захвате не обложка ($c) [$(plugins)]"
+    [ "$r" -gt 200 ] && [ "$g" -lt 60 ] && [ "$b" -gt 200 ] && pass "$1: window is covered in the capture" || fail "$1: capture does not show the cover ($c) [$(plugins)]"
 }
 
-echo "== 1. gloview первым, noshare-cover вторым"
+echo "== 1. gloview first, noshare-cover second"
 start; load $GLV; load $NSC
-echo "     плагины: $(plugins)"
+echo "     plugins: $(plugins)"
 check_cover "gloview→noshare"
 
-echo "== 2. выгрузить noshare-cover при живом gloview"
+echo "== 2. unload noshare-cover while gloview is loaded"
 unload $NSC
-[ -n "$(pgrep -x Hyprland)" ] && pass "Hyprland жив" || fail "Hyprland упал"
-[ "$(grep -c noshare /proc/$(pgrep -x Hyprland)/maps)" -eq 0 ] && pass "noshare-cover выгружен из памяти (gloview не держит handle)" || fail "noshare-cover остался в памяти"
+[ -n "$(pgrep -x Hyprland)" ] && pass "Hyprland alive" || fail "Hyprland crashed"
+[ "$(grep -c noshare /proc/$(pgrep -x Hyprland)/maps)" -eq 0 ] && pass "noshare-cover unmapped from memory (gloview holds no handle)" || fail "noshare-cover still in memory"
 c=$(win_is_cover); read -r r g b <<<"$c"
-[ "$r" -lt 10 ] && [ "$g" -lt 10 ] && [ "$b" -lt 10 ] && pass "без noshare-cover окно в захвате чёрное (Hyprland)" || fail "без noshare-cover: $c"
+[ "$r" -lt 10 ] && [ "$g" -lt 10 ] && [ "$b" -lt 10 ] && pass "without noshare-cover the window is black in the capture (Hyprland)" || fail "without noshare-cover: $c"
 
-echo "== 3. загрузить noshare-cover обратно"
+echo "== 3. load noshare-cover again"
 load $NSC
-check_cover "повторная загрузка"
+check_cover "reload"
 
-echo "== 4. оверлей gloview открыт: превью окна в захвате = обложка"
+echo "== 4. gloview overlay open: window preview in the capture = cover"
 hctl gloview >/dev/null 2>&1 || hctl dispatch 'hl.dsp.exec_cmd("true")' >/dev/null
 sleep 1.5
 f1=$(magenta_share)
 hctl gloview >/dev/null 2>&1; sleep 1.2
-awk "BEGIN{exit !($f1 > 0.005)}" && pass "превью с обложкой в захвате (доля пурпурного $f1)" || fail "в оверлее нет обложки на превью (доля $f1)"
+awk "BEGIN{exit !($f1 > 0.005)}" && pass "preview shows the cover in the capture (magenta share $f1)" || fail "no cover on the overlay preview (share $f1)"
 grep -q "Path C" $W/hypr.log "$XDG_RUNTIME_DIR"/hypr/*/hyprland.log 2>/dev/null; true
 
-echo "== 5. noshare-cover первым, gloview вторым"
+echo "== 5. noshare-cover first, gloview second"
 start; load $NSC; load $GLV
-echo "     плагины: $(plugins)"
+echo "     plugins: $(plugins)"
 check_cover "noshare→gloview"
 
-echo "== 6. 5 циклов выгрузки/загрузки обоих в разном порядке"
+echo "== 6. 5 unload/load cycles of both in varying order"
 for i in 1 2 3 4 5; do unload $GLV; unload $NSC; load $NSC; load $GLV; unload $NSC; load $NSC; done
-[ -n "$(pgrep -x Hyprland)" ] && pass "Hyprland жив после циклов" || fail "Hyprland упал"
-check_cover "после циклов"
+[ -n "$(pgrep -x Hyprland)" ] && pass "Hyprland alive after cycles" || fail "Hyprland crashed"
+check_cover "after cycles"
 pkill -x Hyprland
-echo; [ $FAILS -eq 0 ] && echo "ВСЁ ПРОШЛО" || echo "ОШИБОК: $FAILS"
+echo; [ $FAILS -eq 0 ] && echo "ALL PASSED" || echo "FAILURES: $FAILS"
