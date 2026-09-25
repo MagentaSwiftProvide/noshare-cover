@@ -3,11 +3,10 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    # only for packages.hyprland-git; the main package builds against Hyprland from nixpkgs
-    hyprland = {
-      url = "github:hyprwm/Hyprland";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
+    # packages.default builds against this Hyprland. Point it at yours so they match:
+    #   inputs.noshare-cover.inputs.hyprland.follows = "hyprland";
+    # (no nixpkgs.follows here: Hyprland then comes prebuilt from hyprland.cachix.org)
+    hyprland.url = "github:hyprwm/Hyprland";
   };
 
   outputs =
@@ -78,10 +77,12 @@
     in
     {
       packages = forAll (pkgs: {
-        # Hyprland from nixpkgs, what programs.hyprland.enable installs by default
-        default = mkNoshareCover pkgs pkgs.hyprland;
-        # for those who install Hyprland from the hyprwm/Hyprland flake
-        hyprland-git = mkNoshareCover pkgs hyprland.packages.${pkgs.stdenv.hostPlatform.system}.hyprland;
+        # Hyprland from the hyprwm flake (the `hyprland` input), what most Hyprland-on-Nix
+        # setups run
+        default = mkNoshareCover pkgs hyprland.packages.${pkgs.stdenv.hostPlatform.system}.hyprland;
+        # Hyprland from nixpkgs (programs.hyprland.enable without the hyprwm flake)
+        nixpkgs = mkNoshareCover pkgs pkgs.hyprland;
+        hyprland-git = self.packages.${pkgs.stdenv.hostPlatform.system}.default; # old name
       });
 
       # pkgs.hyprlandPlugins.noshare-cover against final.hyprland
