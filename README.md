@@ -130,6 +130,35 @@ If `renderMonitor` is already hooked by another plugin (gloview does that while 
 isn't loaded), noshare-cover doesn't refuse to load; it waits until the hook is released.
 gloview releases it as soon as it sees noshare-cover, so load order doesn't matter.
 
+## Dependencies
+
+**To build**
+
+| What | Why | Arch | Nix |
+|---|---|---|---|
+| `cargo` / `rustc` (1.89+) | the Rust core | `rust` | in the flake |
+| C++ compiler (C++26), `make`, `pkg-config` | the Hyprland shim | `base-devel`, `pkgconf` | in the flake |
+| Hyprland headers | the plugin API | `hyprland` (hyprpm installs its own) | from the Hyprland package |
+| `nasm` | AV1 decoder assembly (rav1d) | `nasm` | in the flake |
+| `clang` / libclang | bindings for the VA-API helper | `clang` | `bindgenHook` |
+| `libva`, `gbm` headers | the VA-API helper | `libva`, `mesa` | in the flake |
+
+`make NSC_VAAPI=0` builds without VA-API; then clang, libva and gbm are not needed. `make`
+checks everything first and lists what is missing.
+
+**At runtime** (all optional, the plugin loads without any of them)
+
+| What | For | Arch |
+|---|---|---|
+| NVIDIA driver (`libcuda`, `libnvcuvid`) | GPU decoding on NVIDIA (NVDEC) | `nvidia-utils` |
+| `libva` + a VA-API driver | GPU decoding on Intel/AMD | `libva` + `mesa` / `intel-media-driver` |
+| `openh264` | H.264 on the CPU | `openh264` |
+| `libvpx` | VP8/VP9 on the CPU | `libvpx` |
+
+AV1 on the CPU, images and GIFs need nothing extra. With Nix, `openh264` and `libvpx` are
+referenced from the store; the NVIDIA and VA-API drivers come from the system
+(`/run/opengl-driver`).
+
 ## Install
 
 ### hyprpm (Arch and others)
