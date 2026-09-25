@@ -37,7 +37,17 @@ const ENV_PATH: &str = "NOSHARE_COVER_OPENH264";
 
 pub struct H264Decoder {
     dec: Oh264,
+    /// Packets in a row that openh264 refused without producing a picture.
+    refused: u32,
+    last_state: i32,
 }
+
+/// After this many refused packets in a row, report the stream as undecodable
+/// instead of silently showing nothing.
+const MAX_REFUSED: u32 = 90;
+/// DECODING_STATE bits worth naming in the error.
+const DS_NO_PARAM_SETS: i32 = 0x10;
+const DS_BITSTREAM_ERROR: i32 = 0x04;
 
 fn load_api() -> Result<OpenH264API, String> {
     let mut tried = Vec::new();
@@ -69,7 +79,11 @@ impl H264Decoder {
         let api = load_api()?;
         let dec = Oh264::with_api_config(api, DecoderConfig::new())
             .map_err(|e| format!("openh264: {e}"))?;
-        Ok(Self { dec })
+        Ok(Self {
+            dec,
+            refused: 0,
+            last_state: 0,
+        })
     }
 
     fn remaining(&mut self) -> usize {
@@ -134,13 +148,58 @@ fn convert(dst: &[*mut u8; 3], info: &SBufferInfo) -> Option<DecodedFrame> {
     })
 }
 
+fn refusal_text(state: i32) -> String {
+    let why = if state & DS_NO_PARAM_SETS != 0 {
+        "it rejected the SPS/PPS (unsupported profile, e.g. High 10 / 4:2:2)"
+    } else if state & DS_BITSTREAM_ERROR != 0 {
+        "bitstream error"
+    } else {
+        "no pictures"
+    };
+    format!("openh264 can't decode this video: {why}, state {state:#x}; try backend = \"gpu\"")
+}
+
+/// Highest level openh264 accepts (5.2). An SPS above it is rejected outright, the
+/// decoder then has no parameter sets and returns no frames at all.
+const OPENH264_MAX_LEVEL: u8 = 52;
+
+/// Copy of an Annex-B packet with every SPS `level_idc` above 5.2 lowered to 5.2, or
+/// `None` if nothing needs changing. Encoders sometimes write level 6.x for small videos;
+/// the level only bounds buffer sizes, so clamping is harmless for streams that really
+/// fit into 5.2 (anything up to 4K30).
+fn clamp_sps_level(data: &[u8]) -> Option<Vec<u8>> {
+    let mut out: Option<Vec<u8>> = None;
+    let mut i = 0;
+    while i + 3 < data.len() {
+        // start code 00 00 01 (also the tail of 00 00 00 01)
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            let nal = i + 3;
+            // SPS: header (type 7), profile_idc, constraint flags, level_idc
+            if nal + 3 < data.len() && data[nal] & 0x1f == 7 && data[nal + 3] > OPENH264_MAX_LEVEL {
+                out.get_or_insert_with(|| data.to_vec())[nal + 3] = OPENH264_MAX_LEVEL;
+            }
+            i = nal;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 impl Decoder for H264Decoder {
     fn name(&self) -> &'static str {
         "openh264 (CPU)"
     }
 
     fn decode(&mut self, packet: &Packet) -> PipeResult<Vec<DecodedFrame>> {
-        let Ok(len) = i32::try_from(packet.data.len()) else {
+        // Only keyframes carry SPS; copy just those when their level needs clamping.
+        let patched = if packet.keyframe {
+            clamp_sps_level(&packet.data)
+        } else {
+            None
+        };
+        let data: &[u8] = patched.as_deref().unwrap_or(&packet.data);
+        let Ok(len) = i32::try_from(data.len()) else {
             return Ok(Vec::new());
         };
         let mut dst = [null_mut::<u8>(); 3];
@@ -152,14 +211,23 @@ impl Decoder for H264Decoder {
         // The return code is ignored: a broken frame just yields no picture, and
         // the next keyframe fixes everything.
         unsafe {
-            self.dec.raw_api().decode_frame_no_delay(
-                packet.data.as_ptr(),
+            self.last_state = self.dec.raw_api().decode_frame_no_delay(
+                data.as_ptr(),
                 len,
                 dst.as_mut_ptr(),
                 &raw mut info,
-            );
+            ) as i32;
         }
-        Ok(convert(&dst, &info).into_iter().collect())
+        let frames: Vec<DecodedFrame> = convert(&dst, &info).into_iter().collect();
+        if frames.is_empty() && self.last_state != 0 {
+            self.refused += 1;
+            if self.refused >= MAX_REFUSED {
+                return Err(refusal_text(self.last_state));
+            }
+        } else {
+            self.refused = 0;
+        }
+        Ok(frames)
     }
 
     fn flush(&mut self) -> PipeResult<Vec<DecodedFrame>> {
@@ -182,5 +250,27 @@ impl Decoder for H264Decoder {
         // After a loop the demuxer starts at a keyframe with SPS/PPS, and the decoder
         // reconfigures itself; the tail of the previous pass is simply dropped.
         let _ = self.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sps_level_is_clamped_only_when_needed() {
+        // SPS High, level 6.2 (0x3e), then an IDR slice
+        let pkt = [
+            0, 0, 0, 1, 0x67, 0x64, 0x00, 0x3e, 0xac, 0, 0, 1, 0x65, 0x88,
+        ];
+        let fixed = clamp_sps_level(&pkt).unwrap();
+        assert_eq!(fixed[7], 52);
+        assert_eq!(&fixed[..7], &pkt[..7]);
+        assert_eq!(&fixed[8..], &pkt[8..]);
+        // level 4.0 stays, nothing is copied
+        let ok = [0, 0, 0, 1, 0x67, 0x64, 0x00, 0x28, 0xac];
+        assert!(clamp_sps_level(&ok).is_none());
+        // truncated data doesn't panic
+        assert!(clamp_sps_level(&[0, 0, 1, 0x67]).is_none());
     }
 }
