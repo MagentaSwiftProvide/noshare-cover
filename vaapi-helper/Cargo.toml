@@ -1,0 +1,15 @@
+[package]
+name = "noshare-cover-vaapi"
+version = "0.2.0"
+edition = "2024"
+description = "VA-API decode helper for noshare-cover, loaded at runtime via dlopen"
+license = "BSD-3-Clause"
+publish = false
+
+[lib]
+# Отдельная .so: libva/libva-drm/libgbm нужны только ей. Основной плагин
+# вшивает её байты и грузит из memfd; нет libva — нет VA-API, но плагин живёт.
+crate-type = ["cdylib"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cros-codecs = { version = "0.0.6", features = ["vaapi"] }
