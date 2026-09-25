@@ -60,3 +60,5 @@ panic = "unwind"
 # libva 2.23+ (новые поля в VP9-энкодере). Своя копия с одной правкой: vendor/cros-libva.
 [patch.crates-io]
 cros-libva = { path = "vendor/cros-libva" }
+# re_mp4 0.4.0 падает на MP4 с обложкой PNG в метаданных (тип data 14)
+re_mp4 = { path = "vendor/re_mp4" }

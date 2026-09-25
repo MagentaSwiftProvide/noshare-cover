@@ -1,1 +1,2 @@
 vendor/cros-libva: cros-libva 0.0.12 (crates.io, BSD-3-Clause), одна правка в src/buffer/vp9.rs для libva 2.23+
+vendor/re_mp4: re_mp4 0.4.0 (crates.io, MIT/Apache-2.0), неизвестный тип data-атома метаданных = Binary вместо ошибки (MP4 с PNG-обложкой)
