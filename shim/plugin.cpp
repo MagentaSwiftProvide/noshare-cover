@@ -77,6 +77,24 @@
 namespace {
 
     // Window API differences between release and main are confined to this block.
+    // Members that moved between Hyprland versions. `requires` on a template parameter
+    // lets the compiler pick whatever exists in the headers we build against.
+    template <class W>
+    std::string windowClass(const W& w) {
+        if constexpr (requires { w->m_class; })
+            return w->m_class; // 0.56
+        else
+            return std::string{w->metadata().appID()}; // main
+    }
+
+    template <class L>
+    bool layerVisible(const L& l) {
+        if constexpr (requires { l->visible(); })
+            return l->visible(); // 0.56
+        else
+            return l->mapped() && l->acceptsInput() && l->alphaNonZero(); // main, as ScreenshareFrame does
+    }
+
     float windowFade(const PHLWINDOW& w) {
 #ifdef NSC_SPLIT_WINDOW
         return w->presentation().alphaValue(Desktop::View::WINDOW_ALPHA_FADE) * w->presentation().alphaValue(Desktop::View::WINDOW_ALPHA_FULLSCREEN);
@@ -434,7 +452,7 @@ namespace {
             if (!w || !w->m_ruleApplicator || !w->m_ruleApplicator->noScreenShare().valueOrDefault())
                 continue;
             if (!g_pHyprRenderer->shouldRenderWindow(w, mon) || w->isHidden()) {
-                NSC_TRACE("window %s: not rendered on this monitor\n", w->m_class.c_str());
+                NSC_TRACE("window %s: not rendered on this monitor\n", windowClass(w).c_str());
                 continue;
             }
 
@@ -460,15 +478,15 @@ namespace {
             };
             nsc_frame f{};
             if (!nsc_resolve(&req, &f)) {
-                NSC_TRACE("window %s: no cover frame yet\n", w->m_class.c_str());
+                NSC_TRACE("window %s: no cover frame yet\n", windowClass(w).c_str());
                 continue;
             }
             const auto tex = textureFor(f);
             if (!tex) {
-                NSC_TRACE("window %s: texture failed (%ux%u)\n", w->m_class.c_str(), f.width, f.height);
+                NSC_TRACE("window %s: texture failed (%ux%u)\n", windowClass(w).c_str(), f.width, f.height);
                 continue;
             }
-            NSC_TRACE("window %s: cover %ux%u at %.0f,%.0f %.0fx%.0f\n", w->m_class.c_str(), f.width, f.height, box.x, box.y, box.w, box.h);
+            NSC_TRACE("window %s: cover %ux%u at %.0f,%.0f %.0fx%.0f\n", windowClass(w).c_str(), f.width, f.height, box.x, box.y, box.w, box.h);
 
             const bool fullscreen = Fullscreen::controller() && Fullscreen::controller()->isFullscreen(w, Fullscreen::FSMODE_FULLSCREEN);
             const bool dontRound  = capturePos != Vector2D{} || fullscreen;
@@ -485,7 +503,7 @@ namespace {
         // Layers (layer-shell) with no_screen_share: same geometry as Hyprland's
         // black rect, no rounding.
         for (const auto& l : Desktop::layerState()->layers()) {
-            if (!l || !l->m_ruleApplicator || !l->m_ruleApplicator->noScreenShare().valueOrDefault() || !l->visible())
+            if (!l || !l->m_ruleApplicator || !l->m_ruleApplicator->noScreenShare().valueOrDefault() || !layerVisible(l))
                 continue;
             const auto pos  = l->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
             const auto size = l->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
@@ -637,7 +655,7 @@ namespace {
 namespace {
     PLUGIN_DESCRIPTION_INFO initImpl(HANDLE handle) {
         g_handle = handle;
-        const PLUGIN_DESCRIPTION_INFO info{"noshare-cover", "image or video instead of the no_screen_share black box", "gitscout-bot", "2.0.0"};
+        const PLUGIN_DESCRIPTION_INFO info{"noshare-cover", "image or video instead of the no_screen_share black box", "gitscout-bot", "2.0.1"};
 
         // A plugin built against other headers reads wrong field offsets and
         // crashes the compositor. Bail out right away: Hyprland catches the exception,
