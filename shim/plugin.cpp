@@ -637,7 +637,7 @@ namespace {
 namespace {
     PLUGIN_DESCRIPTION_INFO initImpl(HANDLE handle) {
         g_handle = handle;
-        const PLUGIN_DESCRIPTION_INFO info{"noshare-cover", "image or video instead of the no_screen_share black box", "vlad", "0.2"};
+        const PLUGIN_DESCRIPTION_INFO info{"noshare-cover", "image or video instead of the no_screen_share black box", "gitscout-bot", "2.0.0"};
 
         // A plugin built against other headers reads wrong field offsets and
         // crashes the compositor. Bail out right away: Hyprland catches the exception,
