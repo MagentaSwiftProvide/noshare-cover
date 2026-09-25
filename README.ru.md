@@ -49,6 +49,17 @@ hl.window_rule({
 
 Без `no_screen_share` плагин окно не закрывает. Без `path_cover` берётся общий файл. То же для `speed` и `loop`.
 
+## Чужие прямоугольники
+
+Другой плагин может закрыть свои боксы в том же шаре. Библиотека `libnoshare-cover.so`. Hyprland грузит плагины с `RTLD_LOCAL`, поэтому путь бери через `dl_iterate_phdr`, потом `dlopen(path, RTLD_LAZY | RTLD_NOLOAD)` и `dlsym`:
+
+```c
+void noshare_cover_clear_extra_rects(void);
+void noshare_cover_add_extra_rect(int monitor_id, double x, double y, double w, double h, double rounding);
+```
+
+`monitor_id` это id монитора Hyprland (`hyprctl monitors`, поле `id`). `x`, `y`, `w`, `h` и `rounding` в глобальных layout-пикселях, как позиция и размер окна. Плагин вычитает позицию монитора, умножает на scale и вычитает начало захвата. Прямоугольники живут до `noshare_cover_clear_extra_rects`. Рисуются чёрным после крышек окон. `rounding` `0` это острый прямоугольник.
+
 ## Arch
 
 ```sh

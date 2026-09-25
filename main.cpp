@@ -57,6 +57,7 @@ extern "C" {
 #include "managers/fullscreen/FullscreenController.hpp"
 #include "config/values/ConfigValues.hpp"
 #include "plugins/PluginAPI.hpp"
+#include "render/pass/RectPassElement.hpp"
 #include "render/pass/TexPassElement.hpp"
 
 static HANDLE        PHANDLE = nullptr;
@@ -1143,6 +1144,52 @@ static float coverRoundingPower(PHLWINDOW w) {
 #endif
 }
 
+struct SExtraRect {
+    int64_t monitor = 0;
+    double  x = 0, y = 0, w = 0, h = 0, rounding = 0;
+};
+
+static std::mutex             g_extraMu;
+static std::vector<SExtraRect> g_extra;
+
+extern "C" {
+__attribute__((visibility("default"))) void noshare_cover_clear_extra_rects(void) {
+    std::lock_guard<std::mutex> lock(g_extraMu);
+    g_extra.clear();
+}
+
+__attribute__((visibility("default"))) void noshare_cover_add_extra_rect(int monitor_id, double x, double y, double w, double h, double rounding) {
+    if (!(w > 0.0) || !(h > 0.0))
+        return;
+    std::lock_guard<std::mutex> lock(g_extraMu);
+    g_extra.push_back(SExtraRect{static_cast<int64_t>(monitor_id), x, y, w, h, std::max(0.0, rounding)});
+}
+}
+
+static void paintExtraRects(PHLMONITOR mon, const Vector2D& capturePos) {
+    std::vector<SExtraRect> mine;
+    {
+        std::lock_guard<std::mutex> lock(g_extraMu);
+        for (const auto& rect : g_extra) {
+            if (rect.monitor == mon->m_id)
+                mine.push_back(rect);
+        }
+    }
+
+    for (const auto& rect : mine) {
+        const auto box = CBox{rect.x, rect.y, std::max(rect.w, 1.0), std::max(rect.h, 1.0)}.translate(-mon->m_position).scale(mon->m_scale).translate(-capturePos);
+        if (box.w < 1 || box.h < 1)
+            continue;
+        const int round = static_cast<int>(std::lround(rect.rounding * mon->m_scale));
+        g_pHyprRenderer->draw(CRectPassElement::SRectData{
+                                  .box   = box,
+                                  .color = CHyprColor{0.F, 0.F, 0.F, 1.F},
+                                  .round = round,
+                              },
+                              box);
+    }
+}
+
 static void paintCovers(Screenshare::CScreenshareFrame* self) {
     if (!self || !self->m_session || !g_pHyprRenderer)
         return;
@@ -1205,6 +1252,8 @@ static void paintCovers(Screenshare::CScreenshareFrame* self) {
                               },
                               windowBox);
     }
+
+    paintExtraRects(mon, capturePos);
 }
 
 static void hkRenderMonitor(Screenshare::CScreenshareFrame* self) {
@@ -1254,6 +1303,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
+    noshare_cover_clear_extra_rects();
     dropMedia();
     if (Desktop::Rule::windowEffects()) {
         if (g_coverEffect)

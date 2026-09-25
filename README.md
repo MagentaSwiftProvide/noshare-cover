@@ -49,6 +49,17 @@ hl.window_rule({
 
 Without `no_screen_share` the plugin does not cover that window. Without `path_cover` it uses the global file. Same for `speed` and `loop`.
 
+## Extra rects
+
+Other plugins can cover their own boxes in the same screen capture. The library is `libnoshare-cover.so`. Hyprland loads plugins with `RTLD_LOCAL`, so look the file up with `dl_iterate_phdr`, then `dlopen(path, RTLD_LAZY | RTLD_NOLOAD)` and `dlsym` these C symbols:
+
+```c
+void noshare_cover_clear_extra_rects(void);
+void noshare_cover_add_extra_rect(int monitor_id, double x, double y, double w, double h, double rounding);
+```
+
+`monitor_id` is Hyprland's monitor id (`hyprctl monitors`, field `id`). `x`, `y`, `w`, `h` and `rounding` are global layout pixels, the same space as a window position and size. The plugin subtracts the monitor position, multiplies by the monitor scale, then subtracts the capture origin. Rects stay until `noshare_cover_clear_extra_rects`. They are drawn opaque black after the window covers. `rounding` of `0` is a sharp rectangle.
+
 ## Arch
 
 ```sh

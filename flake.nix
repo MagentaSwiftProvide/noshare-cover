@@ -37,6 +37,11 @@
             pluginName = "noshare-cover";
             version = "0.1.0";
             src = ./.;
+            # локальный .so в дереве иначе make считает сборку готовой
+            preBuild = ''
+              rm -f libnoshare-cover.so
+            '';
+            makeFlags = [ "prefix=${placeholder "out"}" ];
             buildInputs = [
               pkgs.cairo
               pkgs.ffmpeg
