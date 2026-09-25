@@ -360,16 +360,30 @@ namespace {
 
     using ApplyZoomFn = void (*)(Monitor::CMonitorZoomController*, CBox&, const Render::SRenderData&);
 
+    // Only the normal monitor render feeds the screencast. m_renderMode is protected in
+    // some releases; there we can't tell and take every call.
+    template <class R>
+    bool normalRender(const R* r) {
+        if constexpr (requires { r->m_renderMode; })
+            return r->m_renderMode == Render::RENDER_MODE_NORMAL;
+        else
+            return true;
+    }
+
     void hkApplyZoom(Monitor::CMonitorZoomController* self, CBox& monbox, const Render::SRenderData& rd) {
         reinterpret_cast<ApplyZoomFn>(g_zoomHook->m_original)(self, monbox, rd);
         const auto mon = rd.pMonitor.lock();
-        if (!mon || g_pHyprRenderer->m_renderMode != Render::RENDER_MODE_NORMAL)
+        if (!mon || !normalRender(g_pHyprRenderer.get()))
             return;
         const auto full = mon->m_transformedSize;
-        if (monbox.x == 0 && monbox.y == 0 && std::abs(monbox.w - full.x) < 0.5 && std::abs(monbox.h - full.y) < 0.5)
+        if (std::abs(monbox.x) < 0.5 && std::abs(monbox.y) < 0.5 && std::abs(monbox.w - full.x) < 0.5 && std::abs(monbox.h - full.y) < 0.5)
             g_zoom.erase(mon->m_id);
-        else
+        else {
+            const auto it = g_zoom.find(mon->m_id);
+            if (it == g_zoom.end() || it->second.box != monbox)
+                NSC_TRACE("zoom %s: %.0f,%.0f %.0fx%.0f of %.0fx%.0f\n", mon->m_name.c_str(), monbox.x, monbox.y, monbox.w, monbox.h, full.x, full.y);
             g_zoom[mon->m_id] = SZoom{.box = monbox, .full = full};
+        }
     }
 
     bool monitorZoomed(const PHLMONITOR& mon) {
@@ -485,8 +499,8 @@ namespace {
     std::unordered_map<uintptr_t, SLastCover> g_lastCovers;
     std::vector<SClosing>                     g_closing;
     constexpr auto                            FADE_BIND_WINDOW = std::chrono::milliseconds(150);
-    // A window last covered longer ago than this was not closed "just now" (the
-    // share was paused in between), so it doesn't get a closing cover.
+    // A window last covered longer ago than this gets a closing cover only if its
+    // fade-out is found (see trackClosedWindows).
     constexpr auto STALE_COVER = std::chrono::seconds(1);
 
     // The last matching rule wins, as in Hyprland itself.
@@ -600,16 +614,25 @@ namespace {
                 continue;
             }
             const auto w = last.win.lock();
-            if (m && (!w || !windowMapped(w)) && now - last.at < STALE_COVER) {
-                g_closing.push_back(SClosing{
+            if (m && (!w || !windowMapped(w))) {
+                SClosing c{
                     .mon           = mon,
                     .box           = last.box,
                     .rules         = last.rules,
                     .rounding      = last.rounding,
                     .roundingPower = last.roundingPower,
                     .bindUntil     = now + FADE_BIND_WINDOW,
-                });
-                NSC_TRACE("window closed: cover kept at %.0f,%.0f %.0fx%.0f\n", last.box.x, last.box.y, last.box.w, last.box.h);
+                };
+                // The stream may have had no frames for a while (static screen), so an old
+                // entry can still be a window closed just now. Keep it only if its fade-out
+                // is running; otherwise it closed long ago and there's nothing to hide.
+                const bool fresh = now - last.at < STALE_COVER;
+                if (!fresh)
+                    c.fade = findFadeFor(c, mon);
+                if (fresh || c.fade.lock()) {
+                    g_closing.push_back(std::move(c));
+                    NSC_TRACE("window closed: cover kept at %.0f,%.0f %.0fx%.0f\n", last.box.x, last.box.y, last.box.w, last.box.h);
+                }
             }
             it = g_lastCovers.erase(it);
         }
@@ -1012,7 +1035,7 @@ namespace {
 namespace {
     PLUGIN_DESCRIPTION_INFO initImpl(HANDLE handle) {
         g_handle = handle;
-        const PLUGIN_DESCRIPTION_INFO info{"noshare-cover", "image or video instead of the no_screen_share black box", "gitscout-bot", "2.0.3"};
+        const PLUGIN_DESCRIPTION_INFO info{"noshare-cover", "image or video instead of the no_screen_share black box", "gitscout-bot", "2.0.4"};
 
         // A plugin built against other headers reads wrong field offsets and
         // crashes the compositor. Bail out right away: Hyprland catches the exception,
