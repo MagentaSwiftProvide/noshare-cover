@@ -26,10 +26,10 @@
           pkgs = import nixpkgs {
             inherit system;
             # overlays.default не тянет hyprland-guiutils, а default.nix Hyprland его требует.
-          overlays = [
-            hyprland.overlays.hyprland-packages
-            hyprland.overlays.hyprland-extras
-          ];
+            overlays = [
+              hyprland.overlays.hyprland-packages
+              hyprland.overlays.hyprland-extras
+            ];
           };
         in
         {
@@ -43,6 +43,10 @@
               pkgs.giflib
               pkgs.libjpeg
             ];
+            meta = {
+              description = "Image or video instead of the no_screen_share black box";
+              homepage = "https://github.com/gitscout-bot/noshare-cover";
+            };
           };
         }
       );
