@@ -87,10 +87,11 @@ The field names of the original plugin (`["no_screen_share_cover:path_cover"]`,
 
 Without `no_screen_share` the window is not covered. If several rules match, the last value wins.
 
-When a window closes, Hyprland replaces it with a snapshot for the close animation, and
-`no_screen_share` does not apply to that snapshot, so without the plugin the window's content
+When a window or layer closes, Hyprland replaces it with a snapshot for the close animation,
+and `no_screen_share` does not apply to that snapshot, so without the plugin its content
 flashes in the stream. The cover follows the snapshot until the animation ends, then stays for
-`close_hold` ms (per window: `no_screen_share_cover_hold`). `0` covers just the animation.
+`close_hold` ms (per window or layer rule: `no_screen_share_cover_hold`). `0` covers just the
+animation.
 
 Cursor zoom (`cursor:zoom_factor`) is handled too: the stream gets the zoomed image, while
 Hyprland places its own `no_screen_share` boxes as if there were no zoom, so they miss the
