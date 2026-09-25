@@ -47,7 +47,12 @@ extern "C" {
 #include "desktop/rule/Engine.hpp"
 #include "desktop/rule/windowRule/WindowRule.hpp"
 #include "desktop/state/WindowState.hpp"
+#if __has_include("desktop/view/window/Window.hpp")
+#include "desktop/view/window/Window.hpp"
+#define NOSHARE_SPLIT_WINDOW 1
+#else
 #include "desktop/view/Window.hpp"
+#endif
 #include "managers/fullscreen/FullscreenController.hpp"
 #include "config/values/ConfigValues.hpp"
 #include "plugins/PluginAPI.hpp"
@@ -1105,6 +1110,38 @@ static SPlay playFor(const PHLWINDOW& w) {
 
 using RenderMonitorFn = void (*)(Screenshare::CScreenshareFrame*);
 
+static float coverFade(PHLWINDOW w) {
+#ifdef NOSHARE_SPLIT_WINDOW
+    return w->presentation().alphaValue(Desktop::View::WINDOW_ALPHA_FADE) * w->presentation().alphaValue(Desktop::View::WINDOW_ALPHA_FULLSCREEN);
+#else
+    return w->alphaValue(Desktop::View::WINDOW_ALPHA_FADE) * w->alphaValue(Desktop::View::WINDOW_ALPHA_FULLSCREEN);
+#endif
+}
+
+static bool coverPinned(PHLWINDOW w) {
+#ifdef NOSHARE_SPLIT_WINDOW
+    return sc<bool>(w->m_state & Desktop::View::WINDOW_STATE_PINNED);
+#else
+    return w->m_pinned;
+#endif
+}
+
+static float coverRounding(PHLWINDOW w) {
+#ifdef NOSHARE_SPLIT_WINDOW
+    return static_cast<float>(w->m_ruleApplicator->rounding().valueOrDefault());
+#else
+    return w->rounding();
+#endif
+}
+
+static float coverRoundingPower(PHLWINDOW w) {
+#ifdef NOSHARE_SPLIT_WINDOW
+    return static_cast<float>(w->m_ruleApplicator->roundingPower().valueOrDefault());
+#else
+    return w->roundingPower();
+#endif
+}
+
 static void paintCovers(Screenshare::CScreenshareFrame* self) {
     if (!self || !self->m_session || !g_pHyprRenderer)
         return;
@@ -1127,10 +1164,10 @@ static void paintCovers(Screenshare::CScreenshareFrame* self) {
             continue;
 
         const auto* ws = w->m_workspace.get();
-        if (!ws && w->alphaValue(Desktop::View::WINDOW_ALPHA_FADE) * w->alphaValue(Desktop::View::WINDOW_ALPHA_FULLSCREEN) != 0.F)
+        if (!ws && coverFade(w) != 0.F)
             continue;
 
-        const auto renderOffset = ws && !w->m_pinned && ws->m_renderOffset ? ws->m_renderOffset->value() : Vector2D{};
+        const auto renderOffset = ws && !coverPinned(w) && ws->m_renderOffset ? ws->m_renderOffset->value() : Vector2D{};
         const auto realSize     = w->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
         const auto realPos      = w->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT) + renderOffset;
         const auto windowBox    = CBox{realPos.x, realPos.y, std::max(realSize.x, 5.0), std::max(realSize.y, 5.0)}
@@ -1156,8 +1193,8 @@ static void paintCovers(Screenshare::CScreenshareFrame* self) {
             continue;
 
         const bool dontRound = capturePos != Vector2D{} || (Fullscreen::controller() && Fullscreen::controller()->isFullscreen(w, Fullscreen::FSMODE_FULLSCREEN));
-        const int  rounding  = dontRound ? 0 : static_cast<int>(std::lround(w->rounding() * mon->m_scale));
-        const auto roundPow  = dontRound ? 2.F : w->roundingPower();
+        const int  rounding  = dontRound ? 0 : static_cast<int>(std::lround(coverRounding(w) * mon->m_scale));
+        const auto roundPow  = dontRound ? 2.F : coverRoundingPower(w);
 
         g_pHyprRenderer->draw(CTexPassElement::SRenderData{
                                   .tex           = cover->tex,
