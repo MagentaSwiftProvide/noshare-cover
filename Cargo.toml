@@ -1,6 +1,6 @@
 [package]
 name = "noshare-cover"
-version = "0.2.0"
+version = "2.0.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Hyprland plugin: image or video instead of the no_screen_share black box"

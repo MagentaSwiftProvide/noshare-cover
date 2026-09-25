@@ -1,10 +1,10 @@
 [repository]
 name = "noshare-cover"
-authors = ["vlad"]
+authors = ["gitscout-bot"]
 
 [noshare-cover]
 description = "Image or video instead of the no_screen_share black box"
-authors = ["vlad"]
+authors = ["gitscout-bot"]
 output = "libnoshare-cover.so"
 # requires cargo (rustup or the rust package) in the user's PATH
 build = ["make -j$(nproc)"]

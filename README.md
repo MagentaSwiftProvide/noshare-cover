@@ -5,7 +5,7 @@
 Hyprland plugin. Windows with `no_screen_share` are covered by an image or a video in a
 screen capture, instead of Hyprland's black box. On the real screen the window stays as it is.
 
-Version 0.2 is a rewrite: the core is Rust (media, decoding, playback clock, lifecycle,
+Version 2.0 is a rewrite: the core is Rust (media, decoding, playback clock, lifecycle,
 public API), and a thin C++ layer talks to Hyprland's C++ plugin API. No FFmpeg, no cairo,
 no external processes.
 

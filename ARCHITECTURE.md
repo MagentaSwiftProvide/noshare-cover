@@ -1,4 +1,4 @@
-# noshare-cover 0.2 architecture
+# noshare-cover 2.0 architecture
 
 ## Why not "pure Rust"
 
