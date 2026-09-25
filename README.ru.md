@@ -4,38 +4,34 @@
 
 Плагин Hyprland. Окна с `no_screen_share` в захвате экрана закрываются картинкой или видео. На самом экране окно не меняется. Картинка растягивается на всё окно.
 
-Плагин грузится из конфига Hyprland. Дефис в имени плагина Lua превращает в подчёркивание:
+Плагин грузится из конфига Hyprland:
 
 ```lua
 hl.plugin.load(os.getenv("HOME") .. "/.config/hypr/plugins/noshare-cover.so")
 
 hl.config({
     plugin = {
-        noshare_cover = {
-            -- png, jpg, jpeg, gif, mp4, m4v, mov, webm, mkv
-            file = "~/.config/hypr/noshare-cover.gif",
-            loop = true,
-            speed = 1.0,
-            -- строка: class или title, regex, путь
-            -- первое совпадение побеждает, иначе берётся file
-            rules = [[
-                class ^(com\.ayugram\.desktop)$ ~/.config/hypr/NoCover/67.mp4
-                title ^Secret ~/.config/hypr/hidden.gif
-            ]],
-        },
+        -- png, jpg, jpeg, gif, mp4, m4v, mov, webm, mkv
+        no_share_cover = "~/.config/hypr/noshare-cover.gif",
+        no_share_cover_loop = true,
+        no_share_cover_speed = 1.0,
     },
 })
 ```
 
-`~` в пути раскрывается. После сохранения конфига Hyprland перечитывает его сам.
-
-На окно всё равно нужно `no_screen_share`, иначе плагину нечего закрывать:
+`no_share_cover` это запасной файл. Свой файл, скорость и луп пишутся на правиле окна. `~` раскрывается. Если подошло несколько правил, побеждает последнее значение.
 
 ```lua
-hl.window_rule({ match = { class = [[^(com\.ayugram\.desktop)$]] }, no_screen_share = true })
+hl.window_rule({
+    match = { class = [[^(com\.ayugram\.desktop)$]] },
+    no_screen_share = true,
+    no_share_cover = "~/.config/hypr/NoCover/67.mp4",
+    no_share_cover_speed = 1.0,
+    no_share_cover_loop = true,
+})
 ```
 
-`loop` и `speed` общие для всех gif и видео.
+Без `no_screen_share` плагин окно не закрывает. Без `no_share_cover` берётся общий файл. То же для скорости и лупа.
 
 ## Arch
 

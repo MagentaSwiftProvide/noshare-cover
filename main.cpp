@@ -26,7 +26,6 @@ extern "C" {
 #include <iomanip>
 #include <memory>
 #include <optional>
-#include <regex>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -37,6 +36,8 @@ extern "C" {
 #include "managers/screenshare/ScreenshareManager.hpp"
 #undef private
 
+#include "desktop/rule/Engine.hpp"
+#include "desktop/rule/windowRule/WindowRule.hpp"
 #include "desktop/state/WindowState.hpp"
 #include "desktop/view/Window.hpp"
 #include "managers/fullscreen/FullscreenController.hpp"
@@ -57,25 +58,19 @@ static void notifyOnce(const std::string& msg) {
     HyprlandAPI::addNotification(PHANDLE, msg, CHyprColor{1.F, 0.2F, 0.2F, 1.F}, 4000);
 }
 
-struct SRule {
-    bool        title = false;
-    std::regex  re;
-    std::string path;
-};
-
 struct SConf {
-    std::string        file;
-    std::string        rulesRaw;
-    std::vector<SRule> rules;
-    bool               loop  = true;
-    double             speed = 1.0;
-    bool               ready = false;
+    std::string file;
+    bool        loop  = true;
+    double      speed = 1.0;
+    bool        ready = false;
 } g_conf;
 
 static SP<Config::Values::CStringValue> g_cfgFile;
 static SP<Config::Values::CBoolValue>   g_cfgLoop;
 static SP<Config::Values::CFloatValue>  g_cfgSpeed;
-static SP<Config::Values::CStringValue> g_cfgRules;
+static Desktop::Rule::CWindowRuleEffectContainer::storageType g_coverEffect = 0;
+static Desktop::Rule::CWindowRuleEffectContainer::storageType g_speedEffect = 0;
+static Desktop::Rule::CWindowRuleEffectContainer::storageType g_loopEffect  = 0;
 
 struct SVideo {
     AVFormatContext* fmt    = nullptr;
@@ -115,8 +110,20 @@ struct SCover {
     SP<Render::ITexture> tex;
     SGif                 gif;
     SVideo               vid;
+    double               speed   = 1.0;
+    bool                 loop    = true;
     bool                 missing = false;
     std::string          error;
+};
+
+struct SPlay {
+    std::string path;
+    double      speed = 1.0;
+    bool        loop  = true;
+
+    std::string key() const {
+        return path + "\n" + std::to_string(speed) + (loop ? "\n1" : "\n0");
+    }
 };
 
 static SCover*                                                      active = nullptr;
@@ -283,11 +290,11 @@ static void syncGif() {
     const auto now = nowMs();
     if (active->gif.t0 == 0)
         active->gif.t0 = now;
-    const double speed = g_conf.speed > 0.0 ? g_conf.speed : 1.0;
+    const double speed = active->speed > 0.0 ? active->speed : 1.0;
     auto         elapsed = static_cast<int64_t>((now - active->gif.t0) * speed);
     if (elapsed < 0)
         elapsed = 0;
-    if (!g_conf.loop)
+    if (!active->loop)
         elapsed = std::min(elapsed, active->gif.totalMs - 1);
     else
         elapsed %= active->gif.totalMs;
@@ -516,12 +523,12 @@ static void syncVideo() {
     if (active->vid.t0 == 0)
         active->vid.t0 = now;
 
-    const double speed = g_conf.speed > 0.0 ? g_conf.speed : 1.0;
+    const double speed = active->speed > 0.0 ? active->speed : 1.0;
     int64_t      elapsedUs = static_cast<int64_t>((now - active->vid.t0) * speed * 1000.0);
     if (elapsedUs < 0)
         elapsedUs = 0;
     if (active->vid.durationUs > 0) {
-        if (g_conf.loop)
+        if (active->loop)
             elapsedUs %= active->vid.durationUs;
         else
             elapsedUs = std::min(elapsedUs, active->vid.durationUs);
@@ -534,7 +541,7 @@ static void syncVideo() {
     int  guard     = 0;
     while (active->vid.lastUs < elapsedUs && guard++ < 48) {
         if (!pullVideoFrame()) {
-            if (g_conf.loop && active->vid.durationUs > 0) {
+            if (active->loop && active->vid.durationUs > 0) {
                 seekVideo(0);
                 active->vid.t0 = now;
             }
@@ -573,63 +580,21 @@ static std::string defaultMediaPath() {
     return "~/.config/hypr/noshare-cover.gif";
 }
 
-static std::string trim(std::string s) {
-    const auto notSpace = [](unsigned char c) { return !std::isspace(c); };
-    s.erase(s.begin(), std::find_if(s.begin(), s.end(), notSpace));
-    s.erase(std::find_if(s.rbegin(), s.rend(), notSpace).base(), s.end());
-    return s;
-}
-
-static std::vector<SRule> parseRules(const std::string& text) {
-    std::vector<SRule> out;
-    std::istringstream lines(text);
-    std::string        line;
-    while (std::getline(lines, line)) {
-        const auto hash = line.find('#');
-        if (hash != std::string::npos)
-            line.resize(hash);
-        std::istringstream ls(line);
-        std::string        kind, pattern;
-        if (!(ls >> kind >> pattern))
-            continue;
-        std::string path;
-        std::getline(ls, path);
-        path = trim(path);
-        if (path.empty())
-            continue;
-        const bool title = kind == "title";
-        if (kind != "class" && !title) {
-            notifyOnce("noshare-cover: правило не class и не title");
-            continue;
-        }
-        try {
-            out.push_back(SRule{title, std::regex{pattern}, expandHome(path)});
-        } catch (const std::regex_error&) {
-            notifyOnce("noshare-cover: кривой regex " + pattern);
-        }
-    }
-    return out;
-}
-
 static bool readConfig() {
-    if (!g_cfgFile || !g_cfgLoop || !g_cfgSpeed || !g_cfgRules)
+    if (!g_cfgFile || !g_cfgLoop || !g_cfgSpeed)
         return false;
 
-    const auto file     = expandHome(g_cfgFile->value().empty() ? defaultMediaPath() : g_cfgFile->value());
-    const auto rulesRaw = g_cfgRules->value();
-    const bool loop     = g_cfgLoop->value();
-    const auto speed    = static_cast<double>(g_cfgSpeed->value());
-    const bool changed  = !g_conf.ready || file != g_conf.file || loop != g_conf.loop || speed != g_conf.speed || rulesRaw != g_conf.rulesRaw;
+    const auto file    = expandHome(g_cfgFile->value().empty() ? defaultMediaPath() : g_cfgFile->value());
+    const bool loop    = g_cfgLoop->value();
+    const auto speed   = static_cast<double>(g_cfgSpeed->value());
+    const bool changed = !g_conf.ready || file != g_conf.file || loop != g_conf.loop || speed != g_conf.speed;
     if (!changed)
         return false;
 
-    if (rulesRaw != g_conf.rulesRaw)
-        g_conf.rules = parseRules(rulesRaw);
-    g_conf.file     = file;
-    g_conf.rulesRaw = rulesRaw;
-    g_conf.loop     = loop;
-    g_conf.speed    = speed;
-    g_conf.ready    = true;
+    g_conf.file  = file;
+    g_conf.loop  = loop;
+    g_conf.speed = speed;
+    g_conf.ready = true;
     return true;
 }
 
@@ -679,10 +644,15 @@ static bool loadMedia(const std::string& path) {
     return true;
 }
 
-static SCover* ensurePath(const std::string& path) {
-    auto it = g_media.find(path);
-    if (it == g_media.end())
-        it = g_media.emplace(path, std::make_unique<SCover>()).first;
+static SCover* ensurePath(const SPlay& play) {
+    const auto key = play.key();
+    auto       it  = g_media.find(key);
+    if (it == g_media.end()) {
+        auto cover   = std::make_unique<SCover>();
+        cover->speed = play.speed;
+        cover->loop  = play.loop;
+        it           = g_media.emplace(key, std::move(cover)).first;
+    }
 
     auto* cover = it->second.get();
     active      = cover;
@@ -690,24 +660,50 @@ static SCover* ensurePath(const std::string& path) {
         return (cover->tex && cover->tex->ok() && cover->tex->m_texID) ? cover : nullptr;
     if (cover->missing) {
         std::error_code ec;
-        if (path.empty() || !std::filesystem::exists(path, ec))
+        if (play.path.empty() || !std::filesystem::exists(play.path, ec))
             return nullptr;
         cover->missing = false;
     } else if (!cover->error.empty())
         return nullptr;
-    if (!loadMedia(path))
+    if (!loadMedia(play.path))
         return nullptr;
     return cover;
 }
 
-static std::string pathFor(const PHLWINDOW& w) {
-    for (const auto& rule : g_conf.rules) {
-        const auto& current = rule.title ? w->m_title : w->m_class;
-        const auto& initial = rule.title ? w->m_initialTitle : w->m_initialClass;
-        if (std::regex_search(current, rule.re) || (initial != current && std::regex_search(initial, rule.re)))
-            return rule.path;
+static bool coverTruthy(const std::string& raw) {
+    const auto val = lower(raw);
+    return !(val == "0" || val == "false" || val == "no" || val == "off");
+}
+
+static SPlay playFor(const PHLWINDOW& w) {
+    SPlay play{g_conf.file, g_conf.speed > 0.0 ? g_conf.speed : 1.0, g_conf.loop};
+    if (!Desktop::Rule::ruleEngine())
+        return play;
+
+    for (const auto& rule : Desktop::Rule::ruleEngine()->rules()) {
+        if (!rule || rule->type() != Desktop::Rule::RULE_TYPE_WINDOW)
+            continue;
+        auto winRule = dynamicPointerCast<Desktop::Rule::CWindowRule>(rule);
+        if (!winRule || !winRule->matches(w))
+            continue;
+        for (const auto& effect : winRule->effects()) {
+            if (effect.raw.empty())
+                continue;
+            if (effect.key == g_coverEffect)
+                play.path = expandHome(effect.raw);
+            else if (effect.key == g_speedEffect) {
+                try {
+                    play.speed = std::stod(effect.raw);
+                } catch (...) {
+                    play.speed = 1.0;
+                }
+                if (play.speed <= 0.0)
+                    play.speed = 1.0;
+            } else if (effect.key == g_loopEffect)
+                play.loop = coverTruthy(effect.raw);
+        }
     }
-    return g_conf.file;
+    return play;
 }
 
 using RenderMonitorFn = void (*)(Screenshare::CScreenshareFrame*);
@@ -748,11 +744,11 @@ static void paintCovers(Screenshare::CScreenshareFrame* self) {
         if (windowBox.w < 1 || windowBox.h < 1)
             continue;
 
-        const auto path  = pathFor(w);
-        auto*      cover = ensurePath(path);
+        const auto play  = playFor(w);
+        auto*      cover = ensurePath(play);
         if (!cover || !cover->tex || !cover->tex->ok() || !cover->tex->m_texID)
             continue;
-        if (synced.insert(path).second) {
+        if (synced.insert(play.key()).second) {
             active = cover;
             if (cover->kind == eKind::Gif)
                 syncGif();
@@ -795,12 +791,15 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         }
     }
 
-    g_cfgFile  = Config::Values::makeConfigValue<Config::Values::CStringValue>("plugin:noshare-cover:file", "Default media for no_screen_share windows", Config::STRING{});
-    g_cfgLoop  = Config::Values::makeConfigValue<Config::Values::CBoolValue>("plugin:noshare-cover:loop", "Loop gif and video", true);
-    g_cfgSpeed = Config::Values::makeConfigValue<Config::Values::CFloatValue>("plugin:noshare-cover:speed", "Playback speed for gif and video", 1.F);
-    g_cfgRules = Config::Values::makeConfigValue<Config::Values::CStringValue>("plugin:noshare-cover:rules", "Per-window media, one 'class' or 'title' rule per line", Config::STRING{});
-    if (!g_cfgFile || !g_cfgLoop || !g_cfgSpeed || !g_cfgRules || !HyprlandAPI::addConfigValueV2(handle, g_cfgFile) || !HyprlandAPI::addConfigValueV2(handle, g_cfgLoop) ||
-        !HyprlandAPI::addConfigValueV2(handle, g_cfgSpeed) || !HyprlandAPI::addConfigValueV2(handle, g_cfgRules))
+    g_coverEffect = Desktop::Rule::windowEffects()->registerEffect("no_share_cover");
+    g_speedEffect = Desktop::Rule::windowEffects()->registerEffect("no_share_cover_speed");
+    g_loopEffect  = Desktop::Rule::windowEffects()->registerEffect("no_share_cover_loop");
+
+    g_cfgFile  = Config::Values::makeConfigValue<Config::Values::CStringValue>("plugin:no_share_cover", "Default media for no_screen_share windows", Config::STRING{});
+    g_cfgLoop  = Config::Values::makeConfigValue<Config::Values::CBoolValue>("plugin:no_share_cover_loop", "Loop gif and video", true);
+    g_cfgSpeed = Config::Values::makeConfigValue<Config::Values::CFloatValue>("plugin:no_share_cover_speed", "Playback speed for gif and video", 1.F);
+    if (!g_coverEffect || !g_speedEffect || !g_loopEffect || !g_cfgFile || !g_cfgLoop || !g_cfgSpeed || !HyprlandAPI::addConfigValueV2(handle, g_cfgFile) ||
+        !HyprlandAPI::addConfigValueV2(handle, g_cfgLoop) || !HyprlandAPI::addConfigValueV2(handle, g_cfgSpeed))
         HyprlandAPI::addNotification(handle, "noshare-cover: конфиг не встал", CHyprColor{1.F, 0.2F, 0.2F, 1.F}, 5000);
 
     if (!addr) {
@@ -819,4 +818,12 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
 APICALL EXPORT void PLUGIN_EXIT() {
     dropMedia();
+    if (Desktop::Rule::windowEffects()) {
+        if (g_coverEffect)
+            Desktop::Rule::windowEffects()->unregisterEffect(g_coverEffect);
+        if (g_speedEffect)
+            Desktop::Rule::windowEffects()->unregisterEffect(g_speedEffect);
+        if (g_loopEffect)
+            Desktop::Rule::windowEffects()->unregisterEffect(g_loopEffect);
+    }
 }

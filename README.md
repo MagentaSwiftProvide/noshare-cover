@@ -4,38 +4,34 @@
 
 Hyprland plugin. Windows with `no_screen_share` are covered by an image or a video in a screen capture. On the real screen the window stays as it is. The picture is stretched to the window.
 
-Load the plugin from the Hyprland config. Hyprland turns the hyphen in the plugin name into an underscore:
+Load the plugin from the Hyprland config:
 
 ```lua
 hl.plugin.load(os.getenv("HOME") .. "/.config/hypr/plugins/noshare-cover.so")
 
 hl.config({
     plugin = {
-        noshare_cover = {
-            -- png, jpg, jpeg, gif, mp4, m4v, mov, webm, mkv
-            file = "~/.config/hypr/noshare-cover.gif",
-            loop = true,
-            speed = 1.0,
-            -- one rule per line: class or title, a regex, then a path
-            -- first match wins, otherwise file is used
-            rules = [[
-                class ^(com\.ayugram\.desktop)$ ~/.config/hypr/NoCover/67.mp4
-                title ^Secret ~/.config/hypr/hidden.gif
-            ]],
-        },
+        -- png, jpg, jpeg, gif, mp4, m4v, mov, webm, mkv
+        no_share_cover = "~/.config/hypr/noshare-cover.gif",
+        no_share_cover_loop = true,
+        no_share_cover_speed = 1.0,
     },
 })
 ```
 
-`~` in a path is expanded. Saving the config reloads it.
-
-A window still needs `no_screen_share`, or the plugin has nothing to cover:
+`no_share_cover` is the fallback file. A window picks its own file, speed, or loop on the rule. `~` is expanded. If several rules match, the last value wins.
 
 ```lua
-hl.window_rule({ match = { class = [[^(com\.ayugram\.desktop)$]] }, no_screen_share = true })
+hl.window_rule({
+    match = { class = [[^(com\.ayugram\.desktop)$]] },
+    no_screen_share = true,
+    no_share_cover = "~/.config/hypr/NoCover/67.mp4",
+    no_share_cover_speed = 1.0,
+    no_share_cover_loop = true,
+})
 ```
 
-`loop` and `speed` apply to every gif and video.
+Without `no_screen_share` the plugin does not cover that window. Without `no_share_cover` it uses the global file. Same for speed and loop.
 
 ## Arch
 
