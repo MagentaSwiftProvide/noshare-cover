@@ -94,6 +94,53 @@
       # custom Hyprland build: noshare-cover.lib.mkNoshareCover pkgs config.programs.hyprland.package
       lib = { inherit mkNoshareCover; };
 
+      # Home Manager: the plugin is always built against the Hyprland you actually run,
+      # so the ABI matches whether Hyprland comes from nixpkgs or the hyprwm flake.
+      #   imports = [ inputs.noshare-cover.homeManagerModules.default ];
+      #   programs.noshare-cover.enable = true;
+      homeManagerModules.default =
+        {
+          config,
+          lib,
+          pkgs,
+          ...
+        }@args:
+        let
+          cfg = config.programs.noshare-cover;
+          hmHyprland = config.wayland.windowManager.hyprland.package;
+          # wayland.windowManager.hyprland.package = null when Hyprland is installed by the
+          # NixOS module; then take the system one.
+          osHyprland = (args.osConfig or { }).programs.hyprland.package or null;
+          hyprlandPkg =
+            if cfg.hyprlandPackage != null then
+              cfg.hyprlandPackage
+            else if hmHyprland != null then
+              hmHyprland
+            else if osHyprland != null then
+              osHyprland
+            else
+              pkgs.hyprland;
+        in
+        {
+          options.programs.noshare-cover = {
+            enable = lib.mkEnableOption "noshare-cover, built against the Hyprland in use";
+            hyprlandPackage = lib.mkOption {
+              type = lib.types.nullOr lib.types.package;
+              default = null;
+              description = "Hyprland to build against. Default: wayland.windowManager.hyprland.package, then programs.hyprland.package of the system, then pkgs.hyprland.";
+            };
+            package = lib.mkOption {
+              type = lib.types.package;
+              readOnly = true;
+              default = mkNoshareCover pkgs hyprlandPkg;
+              description = "The built plugin.";
+            };
+          };
+          config = lib.mkIf cfg.enable {
+            wayland.windowManager.hyprland.plugins = [ cfg.package ];
+          };
+        };
+
       devShells = forAll (pkgs: {
         default = pkgs.mkShell {
           packages = [
