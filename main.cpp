@@ -49,6 +49,7 @@ extern "C" {
 #include "desktop/state/WindowState.hpp"
 #if __has_include("desktop/view/window/Window.hpp")
 #include "desktop/view/window/Window.hpp"
+#include "desktop/view/window/WindowPresentation.hpp"
 #define NOSHARE_SPLIT_WINDOW 1
 #else
 #include "desktop/view/Window.hpp"
@@ -1128,7 +1129,7 @@ static bool coverPinned(PHLWINDOW w) {
 
 static float coverRounding(PHLWINDOW w) {
 #ifdef NOSHARE_SPLIT_WINDOW
-    return static_cast<float>(w->m_ruleApplicator->rounding().valueOrDefault());
+    return w->presentation().rounding();
 #else
     return w->rounding();
 #endif
@@ -1136,7 +1137,7 @@ static float coverRounding(PHLWINDOW w) {
 
 static float coverRoundingPower(PHLWINDOW w) {
 #ifdef NOSHARE_SPLIT_WINDOW
-    return static_cast<float>(w->m_ruleApplicator->roundingPower().valueOrDefault());
+    return w->presentation().roundingPower();
 #else
     return w->roundingPower();
 #endif
