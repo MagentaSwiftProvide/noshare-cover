@@ -410,7 +410,8 @@ impl TryFrom<u8> for AudioObjectType {
             44 => Ok(Self::LowDelayMpegSurround),
             45 => Ok(Self::SpatialAudioObjectCodingDialogueEnhancement),
             46 => Ok(Self::AudioSync),
-            _ => Err(Error::InvalidData("invalid audio object type")),
+            // noshare-cover: audio is never decoded; an odd audio track must not fail the file
+            _ => Ok(Self::AacLowComplexity),
         }
     }
 }
@@ -499,7 +500,7 @@ impl TryFrom<u8> for SampleFreqIndex {
             0xa => Ok(Self::Freq11025),
             0xb => Ok(Self::Freq8000),
             0xc => Ok(Self::Freq7350),
-            _ => Err(Error::InvalidData("invalid sampling frequency index")),
+            _ => Ok(Self::Freq44100), // noshare-cover: see AudioObjectType
         }
     }
 }
@@ -546,7 +547,7 @@ impl TryFrom<u8> for ChannelConfig {
             0x5 => Ok(Self::Five),
             0x6 => Ok(Self::FiveOne),
             0x7 => Ok(Self::SevenOne),
-            _ => Err(Error::InvalidData("invalid channel configuration")),
+            _ => Ok(Self::Stereo), // noshare-cover: see AudioObjectType
         }
     }
 }
@@ -682,8 +683,8 @@ impl TryFrom<u32> for DataType {
             0x000001 => Ok(Self::Text),
             0x00000D => Ok(Self::Image),
             0x000015 => Ok(Self::TempoCpil),
-            // noshare-cover: метаданные (обложка PNG = 14, BE-числа и т.п.) нам не нужны,
-            // неизвестный тип не должен ронять весь файл
+            // noshare-cover: metadata (PNG cover art = 14, BE ints, ...) is never used,
+            // so an unknown type must not fail the whole file
             _ => Ok(Self::Binary),
         }
     }
