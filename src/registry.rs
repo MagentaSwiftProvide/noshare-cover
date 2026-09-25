@@ -1,13 +1,13 @@
-//! Реестр обложек: один источник на уникальные (файл, скорость, петля),
-//! сколько бы окон его ни показывало.
+//! Cover registry: one source per unique (file, speed, loop), no matter how
+//! many windows show it.
 //!
-//! Жизненный цикл:
-//! - смена глобальных настроек — всё сбрасывается, эпоха растёт (прослойка по
-//!   эпохе выкидывает свои текстуры);
-//! - нет файла — пробуем снова раз в секунду, без stat() на каждый кадр;
-//! - не открылся — одно уведомление, повторов нет до смены конфига;
-//! - обложку давно не показывали — источник закрывается (для видео это
-//!   остановка потока декода), а не живёт до выгрузки плагина.
+//! Lifecycle:
+//! - global settings change: everything is reset and the epoch is bumped (the
+//!   shim drops its textures on a new epoch);
+//! - file missing: retry once per second, no stat() on every frame;
+//! - failed to open: one notification, no retries until the config changes;
+//! - cover not shown for a while: the source is closed (for video this stops
+//!   the decode thread) instead of living until the plugin is unloaded.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -17,7 +17,7 @@ use crate::frame::Frame;
 use crate::media::{self, MediaError, Source};
 use crate::notify::Notifier;
 
-/// Как открыть источник по параметрам (в тестах подменяется).
+/// Opens a source for the given parameters (replaced in tests).
 pub type Opener = fn(&PlayParams, &Settings) -> Result<Box<dyn Source>, MediaError>;
 
 const MISSING_RETRY: Duration = Duration::from_secs(1);
@@ -37,7 +37,7 @@ struct Cover {
     last_used: Instant,
 }
 
-/// То, что прослойка рисует: стабильный id обложки (ключ кэша текстур) и кадр.
+/// What the shim draws: a stable cover id (texture cache key) and the frame.
 pub struct CoverView<'a> {
     pub id: u64,
     pub frame: &'a Frame,
@@ -84,12 +84,12 @@ impl Registry {
         &mut self.notifier
     }
 
-    /// Новые глобальные настройки. Если они поменялись — сбрасываем всё.
+    /// New global settings. If they changed, reset everything.
     pub fn set_settings(&mut self, settings: Settings, error: Option<ConfigError>) {
         if self.settings.as_ref() == Some(&settings) {
             return;
         }
-        self.covers.clear(); // drop источников = остановка потоков видео
+        self.covers.clear(); // dropping sources stops the video threads
         self.settings = Some(settings);
         self.epoch += 1;
         self.notifier.reset();
@@ -99,9 +99,9 @@ impl Registry {
         self.prewarm(Instant::now());
     }
 
-    /// Открыть обложку по умолчанию заранее, чтобы первый захват экрана уже
-    /// застал готовый кадр. Видео после этого спит (никто не смотрит), но
-    /// последний кадр держит; вытеснение её не трогает.
+    /// Open the default cover up front so the first screen capture already has
+    /// a frame ready. The video then sleeps (nobody is watching) but keeps its
+    /// last frame; eviction never touches it.
     fn prewarm(&mut self, now: Instant) {
         let play = self.settings().default_play();
         if play.path.as_os_str().is_empty() {
@@ -115,7 +115,7 @@ impl Registry {
         self.frame_no += 1;
     }
 
-    /// Обложка для окна. `None` — рисовать нечего (нет файла, ошибка, ещё нет кадра).
+    /// Cover for a window. `None` means nothing to draw (no file, error, no frame yet).
     pub fn resolve(&mut self, play: &PlayParams, now: Instant) -> Option<CoverView<'_>> {
         let settings = self.settings();
         let frame_no = self.frame_no;
@@ -157,7 +157,7 @@ impl Registry {
         }
 
         if let State::Ready(src) = &mut cover.state {
-            // одна обложка на нескольких окнах опрашивается один раз за кадр
+            // a cover shown in several windows is polled once per frame
             if cover.polled_in != frame_no {
                 cover.polled_in = frame_no;
                 match src.poll(now) {
@@ -179,7 +179,7 @@ impl Registry {
         })
     }
 
-    /// Конец кадра: закрываем то, что давно никто не показывал.
+    /// End of frame: close covers nobody has shown for a while.
     pub fn end_frame(&mut self, now: Instant) {
         let default = self.settings().default_play();
         self.covers.retain(|play, c| {
@@ -187,16 +187,17 @@ impl Registry {
         });
     }
 
-    /// Есть ли недавно показанная анимированная обложка (видео, GIF). Прослойка
-    /// по этому решает, подталкивать ли Hyprland к новым кадрам захвата.
+    /// Whether any live animated cover (video, GIF) exists. The shim uses this
+    /// to decide whether to nudge Hyprland into new capture frames. Covers not
+    /// shown for a while get evicted after EVICT_AFTER anyway.
     pub fn animating(&self, now: Instant) -> bool {
         self.covers.values().any(|c| {
             matches!(&c.state, State::Ready(src) if src.kind() != crate::media::Kind::Still)
-                && now.saturating_duration_since(c.last_used) < Duration::from_secs(1)
+                && now.saturating_duration_since(c.last_used) < EVICT_AFTER
         })
     }
 
-    /// Живые id обложек (прослойка чистит текстуры тех, кого тут нет).
+    /// Live cover ids (the shim frees textures for ids not listed here).
     pub fn live_ids(&self) -> impl Iterator<Item = u64> + '_ {
         self.covers.values().map(|c| c.id)
     }
@@ -205,7 +206,8 @@ impl Registry {
         match (self.opener)(play, settings) {
             Ok(s) => State::Ready(s),
             Err(MediaError::Missing(p)) => {
-                self.notifier.push(format!("noshare-cover: нет файла {p}"));
+                self.notifier
+                    .push(format!("noshare-cover: file not found: {p}"));
                 State::Missing {
                     retry_at: now + MISSING_RETRY,
                 }
@@ -233,7 +235,7 @@ mod tests {
     use crate::media::Kind;
     use std::cell::Cell;
 
-    // счётчик на поток: тесты идут параллельно, общий static дал бы ложные падения
+    // per-thread counter: tests run in parallel, a shared static would cause spurious failures
     thread_local!(static OPENS: Cell<usize> = const { Cell::new(0) });
 
     fn opens() -> usize {
@@ -278,7 +280,7 @@ mod tests {
         }
     }
 
-    /// Реестр с настройками; обложка по умолчанию (/default) уже прогрета.
+    /// Registry with settings; the default cover (/default) is already prewarmed.
     fn reg() -> Registry {
         let mut r = Registry::with_opener(opener);
         r.set_settings(defaults(), None);
@@ -288,13 +290,13 @@ mod tests {
     #[test]
     fn default_cover_is_prewarmed_and_kept() {
         let r = reg();
-        assert_eq!(r.len(), 1, "обложка по умолчанию открыта сразу");
+        assert_eq!(r.len(), 1, "default cover is opened right away");
         let mut r = r;
         r.end_frame(Instant::now() + EVICT_AFTER * 3);
         assert_eq!(
             r.len(),
             1,
-            "и не вытесняется, даже если её долго не показывали"
+            "and never evicted, even if unused for a long time"
         );
     }
 
@@ -344,7 +346,7 @@ mod tests {
         assert_eq!(
             r.len(),
             1,
-            "всё сброшено, заново прогрета только обложка по умолчанию"
+            "everything reset, only the default cover is prewarmed again"
         );
         r.begin_frame();
         assert_ne!(
@@ -371,7 +373,7 @@ mod tests {
         r.end_frame(now + Duration::from_secs(5));
         assert_eq!(r.len(), 2);
         r.end_frame(now + EVICT_AFTER + Duration::from_secs(1));
-        assert_eq!(r.len(), 1, "/a вытеснена, /default осталась");
+        assert_eq!(r.len(), 1, "/a evicted, /default kept");
     }
 
     #[test]
@@ -383,7 +385,7 @@ mod tests {
             r.begin_frame();
             r.resolve(&play("/missing"), now + Duration::from_millis(i * 10));
         }
-        // первое открытие; повторы — только после бэкоффа и только если файл появился
+        // first open only; retries happen after the backoff and only if the file appears
         assert_eq!(opens() - before, 1);
     }
 }

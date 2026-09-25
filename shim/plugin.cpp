@@ -1,11 +1,11 @@
-// noshare-cover: тонкая прослойка между Hyprland и Rust-ядром.
+// noshare-cover: thin shim between Hyprland and the Rust core.
 //
-// Здесь только то, что без C++ ABI Hyprland не сделать:
-//   - хук CScreenshareFrame::renderMonitor (кадр скриншера);
-//   - регистрация значений конфига и эффектов правил окон;
-//   - геометрия окон и отрисовка через render pass;
-//   - превращение кадров ядра в текстуры (пиксели или dmabuf, без cairo).
-// Вся логика медиа, декода, часов и жизненного цикла — в Rust (src/).
+// Only what can't be done without the Hyprland C++ ABI lives here:
+//   - the CScreenshareFrame::renderMonitor hook (screencast frame);
+//   - registering config values and window rule effects;
+//   - window geometry and drawing via the render pass;
+//   - turning core frames into textures (pixels or dmabuf, no cairo).
+// All media, decoding, clock and lifecycle logic is in Rust (src/).
 
 #include "../include/noshare_cover.h"
 
@@ -46,7 +46,7 @@
 #include "desktop/state/LayerState.hpp"
 #include "desktop/view/LayerSurface.hpp"
 #include "desktop/state/WindowState.hpp"
-// main (0.57-dev) разнёс окно на Window + WindowPresentation; релиз 0.56 — ещё одним классом.
+// main (0.57-dev) split the window into Window + WindowPresentation; release 0.56 still has a single class.
 #if __has_include("desktop/view/window/Window.hpp")
 #include "desktop/view/window/Window.hpp"
 #include "desktop/view/window/WindowPresentation.hpp"
@@ -67,16 +67,16 @@
 
 #include <aquamarine/buffer/Buffer.hpp>
 
-// m_session у кадра скриншера приватный, публичного события для отрисовки в
-// кадр скриншера upstream не даёт. Всё, что этот заголовок тянет, уже включено
-// выше, так что `private public` касается только его собственных классов.
+// The screencast frame's m_session is private, and upstream offers no public event
+// for drawing into the screencast frame. Everything this header pulls in is already
+// included above, so `private public` only affects its own classes.
 #define private public
 #include "managers/screenshare/ScreenshareManager.hpp"
 #undef private
 
 namespace {
 
-    // Разница API окна между релизом и main — только здесь.
+    // Window API differences between release and main are confined to this block.
     float windowFade(const PHLWINDOW& w) {
 #ifdef NSC_SPLIT_WINDOW
         return w->presentation().alphaValue(Desktop::View::WINDOW_ALPHA_FADE) * w->presentation().alphaValue(Desktop::View::WINDOW_ALPHA_FULLSCREEN);
@@ -110,27 +110,32 @@ namespace {
     }
 
     HANDLE         g_handle = nullptr;
-    // после каждой перезагрузки конфига отдаём ядру настройки сразу, а не на первом
-    // кадре скриншера: обложка по умолчанию успевает прогреться до захвата
+    // push settings to the core right after every config reload, not on the first
+    // screencast frame: the default cover gets warmed up before capture starts
     CHyprSignalListener g_onReload;
 
-    // renderMonitor может быть занят другим плагином (gloview занимает его, пока
-    // noshare-cover не загружен). Тогда не отказываемся от загрузки, а пробуем
-    // перехватить снова: gloview отпускает функцию, увидев noshare-cover после
-    // перезагрузки конфига. Таймер свой — снимается в PLUGIN_EXIT.
+    // renderMonitor may be hooked by another plugin (gloview takes it while
+    // noshare-cover isn't loaded). In that case don't fail the load, keep retrying
+    // the hook: gloview releases the function once it sees noshare-cover after a
+    // config reload. The timer is ours and is removed in PLUGIN_EXIT.
     void*                  g_hookTarget = nullptr;
     SP<CEventLoopTimer>    g_hookRetry;
     constexpr auto         HOOK_RETRY_EVERY = std::chrono::milliseconds(500);
 
-    // Hyprland рендерит кадр захвата только когда на экране что-то изменилось.
-    // Видео в обложке само ничего не «портит», поэтому при статичном экране
-    // трансляция стояла бы или шла рывками. Пока идёт захват и есть живая
-    // анимация, помечаем области обложек изменёнными ~60 раз в секунду.
-    std::vector<CBox>                     g_animBoxes; // глобальные логические координаты
-    std::chrono::steady_clock::time_point g_lastCapture;
-    SP<CEventLoopTimer>                   g_pump;
-    constexpr auto                        PUMP_EVERY  = std::chrono::milliseconds(16);
-    constexpr auto                        PUMP_LINGER = std::chrono::seconds(1);
+    // Hyprland renders a capture frame only when the monitor repaints, and it
+    // repaints only on damage. A video cover doesn't damage anything by itself,
+    // so on a static monitor (e.g. while you work on another one) the stream
+    // would freeze. While the monitor is being shared and has a live animation,
+    // we damage the cover areas ~60 times per second.
+    // The condition is the share itself, not a recent capture frame: otherwise
+    // a pause in frames would stop the pump and nothing could wake it up again.
+    struct SAnimBox {
+        PHLMONITORREF mon;
+        CBox          box; // global logical coordinates
+    };
+    std::vector<SAnimBox> g_animBoxes;
+    SP<CEventLoopTimer>   g_pump;
+    constexpr auto        PUMP_EVERY = std::chrono::milliseconds(16);
     CFunctionHook* g_hook   = nullptr;
 
     SP<Config::Values::CStringValue> g_cfgPath;
@@ -141,12 +146,12 @@ namespace {
 
     using EffectId = Desktop::Rule::CWindowRuleEffectContainer::storageType;
 
-    // Эффекты правил. Lua-конфиг upstream передаёт плагинам только плоские поля
-    // (string/bool/number, таблицы отвергает), поэтому основные имена — обычные
-    // Lua-идентификаторы, без обёрток над hl.window_rule:
+    // Rule effects. Upstream's Lua config passes only flat fields to plugins
+    // (string/bool/number, tables are rejected), so the primary names are plain
+    // Lua identifiers, no wrappers around hl.window_rule:
     //   hl.window_rule({ match = {...}, no_screen_share = true,
     //                    no_screen_share_cover = "~/x.mp4", no_screen_share_cover_speed = 1.5 })
-    // Имена с двоеточием — из исходного плагина, чтобы старые конфиги не ломались.
+    // Colon names come from the original plugin, so old configs keep working.
     enum eField : uint8_t { FIELD_PATH, FIELD_SPEED, FIELD_LOOP };
     struct SEffect {
         const char* name;
@@ -161,7 +166,7 @@ namespace {
         {"no_screen_share_cover:speed", FIELD_SPEED},
         {"no_screen_share_cover:loop", FIELD_LOOP},
     }};
-    // Те же поля для layer rule (бары, лаунчеры и прочий layer-shell):
+    // Same fields for layer rules (bars, launchers and other layer-shell surfaces):
     //   hl.layer_rule({ match = { namespace = "waybar" }, no_screen_share = true, no_screen_share_cover = "~/x.png" })
     std::array<SEffect, 6> g_layerEffects = {{
         {"no_screen_share_cover", FIELD_PATH},
@@ -172,7 +177,7 @@ namespace {
         {"no_screen_share_cover:loop", FIELD_LOOP},
     }};
 
-    // Кэш текстур по id обложки. Сбрасывается целиком при смене эпохи ядра.
+    // Texture cache keyed by cover id. Cleared entirely when the core epoch changes.
     struct SCachedTexture {
         SP<Render::ITexture> tex;
         uint64_t             generation = 0;
@@ -188,7 +193,7 @@ namespace {
             HyprlandAPI::addNotification(g_handle, msg, CHyprColor{1.F, 0.2F, 0.2F, 1.F}, time);
     }
 
-    // NOSHARE_COVER_DEBUG=<файл> — трейс по шагам (для отладки на чужой машине)
+    // NOSHARE_COVER_DEBUG=<file>: step-by-step trace (for debugging on someone else's machine)
     FILE* const g_trace = [] {
         const char* v = std::getenv("NOSHARE_COVER_DEBUG");
         return v && *v ? std::fopen(v, "a") : nullptr;
@@ -219,7 +224,7 @@ namespace {
             .backend    = backend.c_str(),
             .gpu_device = gpu.c_str(),
         };
-        nsc_set_settings(&s); // ядро само сравнит с прошлыми и сбросит обложки только при изменении
+        nsc_set_settings(&s); // the core diffs against the previous settings and resets covers only on change
 
         if (const auto epoch = nsc_epoch(); epoch != g_epoch) {
             g_textures.clear();
@@ -227,7 +232,7 @@ namespace {
         }
     }
 
-    // Кадр ядра -> текстура Hyprland. Новая текстура — только когда сменился кадр.
+    // Core frame -> Hyprland texture. A new texture only when the frame changed.
     SP<Render::ITexture> textureFor(const nsc_frame& f) {
         auto& c = g_textures[f.cover_id];
         if (c.tex && c.generation == f.generation)
@@ -266,19 +271,19 @@ namespace {
         return (c.tex && c.tex->ok()) ? c.tex : nullptr;
     }
 
-    // Раз в пару секунд выкидываем текстуры обложек, которых ядро уже закрыло.
+    // Every couple of seconds, drop textures of covers the core has already closed.
     void pruneTextures() {
         if (++g_frameCount % 120 != 0)
             return;
         std::erase_if(g_textures, [](const auto& kv) { return !nsc_cover_alive(kv.first); });
     }
 
-    // Последнее совпавшее правило побеждает — как у самого Hyprland.
+    // The last matching rule wins, same as in Hyprland itself.
     struct SRuleValues {
         std::optional<std::string> path, speed, loop;
     };
 
-    // Последнее совпавшее правило побеждает, как у самого Hyprland.
+    // The last matching rule wins, as in Hyprland itself.
     template <class RuleT, class TargetT, size_t N>
     SRuleValues collectRuleValues(const TargetT& target, Desktop::Rule::eRuleType type, const std::array<SEffect, N>& ids) {
         SRuleValues out;
@@ -316,7 +321,7 @@ namespace {
         return collectRuleValues<Desktop::Rule::CLayerRule>(l, Desktop::Rule::RULE_TYPE_LAYER, g_layerEffects);
     }
 
-    // Обложка окна для прямоугольника другого плагина: те же правила, что и у самого окна.
+    // Window cover for another plugin's rect: same rules as for the window itself.
     SP<Render::ITexture> coverForWindowAddress(uint64_t address) {
         if (!address)
             return nullptr;
@@ -336,7 +341,7 @@ namespace {
     }
 
     void paintExtraRects(const PHLMONITOR& mon, const Vector2D& capturePos) {
-        // Обычно это десятки плиток оверлея; если больше — берём столько, сколько отдали.
+        // Usually a few dozen overlay tiles; if there are more, take as many as reported.
         std::vector<nsc_extra_rect> rects(64);
         size_t                      n = nsc_extra_rects(mon->m_id, rects.data(), rects.size());
         if (n > rects.size()) {
@@ -368,13 +373,22 @@ namespace {
     }
 
     void pumpTick(SP<CEventLoopTimer> self, void*) {
-        const bool capturing = std::chrono::steady_clock::now() - g_lastCapture < PUMP_LINGER;
-        if (!capturing || g_animBoxes.empty() || !nsc_animating() || !g_pHyprRenderer) {
-            self->updateTimeout(std::nullopt); // трансляция кончилась — стоим
+        const auto& mgr = Screenshare::mgr();
+        bool       any = false;
+        if (mgr && g_pHyprRenderer && nsc_animating()) {
+            for (const auto& a : g_animBoxes) {
+                const auto mon = a.mon.lock();
+                if (!mon || !mgr->isOutputBeingSSd(mon))
+                    continue;
+                g_pHyprRenderer->damageBox(a.box);
+                any = true;
+            }
+        }
+        if (!any) {
+            g_animBoxes.clear();
+            self->updateTimeout(std::nullopt); // sharing stopped, go idle
             return;
         }
-        for (const auto& b : g_animBoxes)
-            g_pHyprRenderer->damageBox(b);
         self->updateTimeout(PUMP_EVERY);
     }
 
@@ -410,8 +424,8 @@ namespace {
 
         pushSettings();
         nsc_begin_frame();
-        g_animBoxes.clear();
-        g_lastCapture = std::chrono::steady_clock::now();
+        // rebuild this monitor's covers, leave other monitors alone
+        std::erase_if(g_animBoxes, [&](const SAnimBox& a) { return a.mon.expired() || a.mon.lock() == mon; });
         NSC_TRACE("frame: monitor %s\n", mon->m_name.c_str());
 
         const auto capturePos = frame->m_session->m_captureBox.pos();
@@ -436,7 +450,7 @@ namespace {
             const auto box          = CBox{pos.x, pos.y, std::max(size.x, 5.0), std::max(size.y, 5.0)}.translate(-mon->m_position).scale(mon->m_scale).translate(-capturePos);
             if (box.w < 1 || box.h < 1)
                 continue;
-            g_animBoxes.emplace_back(pos.x, pos.y, size.x, size.y);
+            g_animBoxes.push_back({mon, CBox{pos.x, pos.y, size.x, size.y}});
 
             const auto             rules = ruleValuesFor(w);
             const nsc_play_request req{
@@ -468,8 +482,8 @@ namespace {
                 box);
         }
 
-        // Слои (layer-shell) с no_screen_share: та же геометрия, что у чёрного
-        // прямоугольника Hyprland, без скругления.
+        // Layers (layer-shell) with no_screen_share: same geometry as Hyprland's
+        // black rect, no rounding.
         for (const auto& l : Desktop::layerState()->layers()) {
             if (!l || !l->m_ruleApplicator || !l->m_ruleApplicator->noScreenShare().valueOrDefault() || !l->visible())
                 continue;
@@ -478,7 +492,7 @@ namespace {
             const auto box  = CBox{pos.x, pos.y, std::max(size.x, 5.0), std::max(size.y, 5.0)}.translate(-mon->m_position).scale(mon->m_scale).translate(-capturePos);
             if (box.w < 1 || box.h < 1)
                 continue;
-            g_animBoxes.emplace_back(pos.x, pos.y, size.x, size.y);
+            g_animBoxes.push_back({mon, CBox{pos.x, pos.y, size.x, size.y}});
             const auto             rules = ruleValuesFor(l);
             const nsc_play_request req{
                 .rule_path  = rules.path ? rules.path->c_str() : nullptr,
@@ -514,14 +528,14 @@ namespace {
     SP<T> makeValue(const char* name, const char* desc, Args&&... def) {
         auto v = Config::Values::makeConfigValue<T>(name, desc, std::forward<Args>(def)...);
         if (!v || !HyprlandAPI::addConfigValueV2(g_handle, v))
-            notify(std::string("noshare-cover: не встал параметр ") + name, 5000);
+            notify(std::string("noshare-cover: failed to register config value ") + name, 5000);
         return v;
     }
 
 } // namespace
 
-// Публичный ABI для других плагинов (include/noshare_cover_api.h). Rust-архив
-// слинкован скрытым, поэтому наружу имена выставляем здесь, тонкими обёртками.
+// Public ABI for other plugins (include/noshare_cover_api.h). The Rust archive
+// is linked hidden, so the symbols are exported here via thin wrappers.
 #define NSC_PUBLIC extern "C" __attribute__((visibility("default")))
 NSC_PUBLIC uint32_t noshare_cover_api_version() {
     return nsc_api_api_version();
@@ -581,11 +595,11 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_handle = handle;
     const PLUGIN_DESCRIPTION_INFO info{"noshare-cover", "image or video instead of the no_screen_share black box", "vlad", "0.2"};
 
-    // Плагин, собранный под другие заголовки, лезет в чужие смещения полей и
-    // роняет композитор. Отказываемся сразу: Hyprland поймает исключение,
-    // выгрузит плагин и покажет причину.
+    // A plugin built against other headers reads wrong field offsets and
+    // crashes the compositor. Bail out right away: Hyprland catches the exception,
+    // unloads the plugin and shows the reason.
     if (std::string{__hyprland_api_get_hash()} != __hyprland_api_get_client_hash()) {
-        notify("noshare-cover: собран под другую версию Hyprland, пересоберите (hyprpm update)", 10000);
+        notify("noshare-cover: built for a different Hyprland version, rebuild it (hyprpm update)", 10000);
         throw std::runtime_error("noshare-cover: Hyprland version mismatch");
     }
 
@@ -620,8 +634,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     g_hookTarget = target;
     if (!tryInstallHook()) {
-        // Занят другим плагином. Ждём, пока отпустит (новый gloview делает это сам
-        // сразу после перезагрузки конфига); до тех пор обложки не рисуются.
+        // Hooked by another plugin. Wait until it's released (newer gloview does this
+        // right after a config reload); until then no covers are drawn.
         NSC_TRACE("renderMonitor busy, retrying\n");
         g_hookRetry = makeShared<CEventLoopTimer>(
             HOOK_RETRY_EVERY,
@@ -643,16 +657,16 @@ APICALL EXPORT void PLUGIN_EXIT() {
     g_onReload.reset();
     stopHookRetry();
     stopPump();
-    // Сначала снимаем хук: Hyprland чистит хуки уже после PLUGIN_EXIT, и кадр
-    // скриншера между этим не должен попасть в выгруженное ядро.
+    // Remove the hook first: Hyprland cleans up hooks only after PLUGIN_EXIT, and a
+    // screencast frame in between must not land in the unloaded core.
     if (g_hook) {
         HyprlandAPI::removeFunctionHook(g_handle, g_hook);
         g_hook = nullptr;
     }
-    // Клиенты API (gloview) забывают наши указатели и могут занять renderMonitor.
+    // API clients (gloview) drop our pointers and may take over renderMonitor.
     nsc_api_notify_gone();
     g_textures.clear();
-    nsc_shutdown(); // останавливает и join-ит потоки декода, чистит extra rects
+    nsc_shutdown(); // stops and joins decode threads, clears extra rects
 
     if (const auto& fx = Desktop::Rule::windowEffects()) {
         for (const auto& e : g_effects)
