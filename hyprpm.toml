@@ -1,0 +1,9 @@
+[repository]
+name = "noshare-cover"
+authors = ["vlad"]
+
+[noshare-cover]
+description = "Image or video instead of the no_screen_share black box"
+authors = ["vlad"]
+output = "libnoshare-cover.so"
+build = ["make -j$(nproc)"]

@@ -4,47 +4,60 @@
 
 Hyprland plugin. Windows with `no_screen_share` are covered by an image or a video in a screen capture. On the real screen the window stays as it is. The picture is stretched to the window.
 
-Load the plugin from the Hyprland config:
+hyprpm loads the plugin. Do not also call `hl.plugin.load`.
 
 ```lua
-hl.plugin.load(os.getenv("HOME") .. "/.config/hypr/plugins/noshare-cover.so")
-
 hl.config({
     plugin = {
-        -- png, jpg, jpeg, gif, mp4, m4v, mov, webm, mkv
-        no_share_cover = "~/.config/hypr/noshare-cover.gif",
-        no_share_cover_loop = true,
-        no_share_cover_speed = 1.0,
+        no_screen_share_cover = {
+            -- png, jpg, jpeg, gif, mp4, m4v, mov, webm, mkv
+            path_cover = "~/.config/hypr/noshare-cover.gif",
+            loop = true,
+            speed = 1.0,
+        },
     },
 })
 ```
 
-`no_share_cover` is the fallback file. A window picks its own file, speed, or loop on the rule. `~` is expanded. If several rules match, the last value wins.
+`path_cover` is the fallback. A window can set its own table on the rule. `~` is expanded. If several rules match, the last value wins.
+
+Hyprland window rules only accept flat fields, so unwrap the table once, before any `hl.window_rule`:
 
 ```lua
+do
+    local raw = hl.window_rule
+    function hl.window_rule(opts)
+        if type(opts) == "table" and type(opts.no_screen_share_cover) == "table" then
+            local cover = opts.no_screen_share_cover
+            opts.no_screen_share_cover = nil
+            if cover.path_cover ~= nil then opts["no_screen_share_cover:path_cover"] = cover.path_cover end
+            if cover.speed ~= nil then opts["no_screen_share_cover:speed"] = cover.speed end
+            if cover.loop ~= nil then opts["no_screen_share_cover:loop"] = cover.loop end
+        end
+        return raw(opts)
+    end
+end
+
 hl.window_rule({
     match = { class = [[^(com\.ayugram\.desktop)$]] },
     no_screen_share = true,
-    no_share_cover = "~/.config/hypr/NoCover/67.mp4",
-    no_share_cover_speed = 1.0,
-    no_share_cover_loop = true,
+    no_screen_share_cover = {
+        path_cover = "~/.config/hypr/NoCover/67.mp4",
+    },
 })
 ```
 
-Without `no_screen_share` the plugin does not cover that window. Without `no_share_cover` it uses the global file. Same for speed and loop.
+Without `no_screen_share` the plugin does not cover that window. Without `path_cover` it uses the global file. Same for `speed` and `loop`.
 
 ## Arch
 
 ```sh
-sudo pacman -S --needed hyprland cairo ffmpeg giflib libjpeg-turbo pkgconf gcc make
-git clone https://github.com/gitscout-bot/noshare-cover
-cd noshare-cover
-make local
+hyprpm add https://github.com/gitscout-bot/noshare-cover
+hyprpm enable noshare-cover
+hyprpm reload
 ```
 
-`make local` installs `~/.config/hypr/plugins/noshare-cover.so`. Put `hl.plugin.load(...)` in the config, as above, and reload Hyprland.
-
-The build needs `hyprland.pc` from the same Hyprland that is running. The `hyprland` package ships it. If you build Hyprland yourself, point `PKG_CONFIG_PATH` at that build before `make`.
+hyprpm builds against the running Hyprland and loads the plugin itself.
 
 ## Nix
 

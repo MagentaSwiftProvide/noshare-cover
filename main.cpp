@@ -791,13 +791,13 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         }
     }
 
-    g_coverEffect = Desktop::Rule::windowEffects()->registerEffect("no_share_cover");
-    g_speedEffect = Desktop::Rule::windowEffects()->registerEffect("no_share_cover_speed");
-    g_loopEffect  = Desktop::Rule::windowEffects()->registerEffect("no_share_cover_loop");
+    g_coverEffect = Desktop::Rule::windowEffects()->registerEffect("no_screen_share_cover:path_cover");
+    g_speedEffect = Desktop::Rule::windowEffects()->registerEffect("no_screen_share_cover:speed");
+    g_loopEffect  = Desktop::Rule::windowEffects()->registerEffect("no_screen_share_cover:loop");
 
-    g_cfgFile  = Config::Values::makeConfigValue<Config::Values::CStringValue>("plugin:no_share_cover", "Default media for no_screen_share windows", Config::STRING{});
-    g_cfgLoop  = Config::Values::makeConfigValue<Config::Values::CBoolValue>("plugin:no_share_cover_loop", "Loop gif and video", true);
-    g_cfgSpeed = Config::Values::makeConfigValue<Config::Values::CFloatValue>("plugin:no_share_cover_speed", "Playback speed for gif and video", 1.F);
+    g_cfgFile  = Config::Values::makeConfigValue<Config::Values::CStringValue>("plugin:no_screen_share_cover:path_cover", "Default media for no_screen_share windows", Config::STRING{});
+    g_cfgLoop  = Config::Values::makeConfigValue<Config::Values::CBoolValue>("plugin:no_screen_share_cover:loop", "Loop gif and video", true);
+    g_cfgSpeed = Config::Values::makeConfigValue<Config::Values::CFloatValue>("plugin:no_screen_share_cover:speed", "Playback speed for gif and video", 1.F);
     if (!g_coverEffect || !g_speedEffect || !g_loopEffect || !g_cfgFile || !g_cfgLoop || !g_cfgSpeed || !HyprlandAPI::addConfigValueV2(handle, g_cfgFile) ||
         !HyprlandAPI::addConfigValueV2(handle, g_cfgLoop) || !HyprlandAPI::addConfigValueV2(handle, g_cfgSpeed))
         HyprlandAPI::addNotification(handle, "noshare-cover: конфиг не встал", CHyprColor{1.F, 0.2F, 0.2F, 1.F}, 5000);
