@@ -231,10 +231,11 @@ namespace {
     }};
     // Same fields for layer rules (bars, launchers and other layer-shell surfaces):
     //   hl.layer_rule({ match = { namespace = "waybar" }, no_screen_share = true, no_screen_share_cover = "~/x.png" })
-    std::array<SEffect, 6> g_layerEffects = {{
+    std::array<SEffect, 7> g_layerEffects = {{
         {"no_screen_share_cover", FIELD_PATH},
         {"no_screen_share_cover_speed", FIELD_SPEED},
         {"no_screen_share_cover_loop", FIELD_LOOP},
+        {"no_screen_share_cover_hold", FIELD_HOLD},
         {"no_screen_share_cover:path_cover", FIELD_PATH},
         {"no_screen_share_cover:speed", FIELD_SPEED},
         {"no_screen_share_cover:loop", FIELD_LOOP},
@@ -471,14 +472,16 @@ namespace {
             nullptr);
     }
 
-    // Closing windows. Hyprland replaces a closed window with a snapshot fade-out
-    // (Desktop::fadingOutState()), and no_screen_share doesn't apply to it, so the
-    // window's content shows up in the stream for the whole close animation. We
-    // remember every covered window from the last frame; when one disappears, the
+    // Closing windows and layers. Hyprland replaces a closed window or layer with a
+    // snapshot fade-out (Desktop::fadingOutState()), and no_screen_share doesn't apply
+    // to it, so the content shows up in the stream for the whole close animation. We
+    // remember everything covered in the last frame; when something disappears, the
     // cover follows its fade-out until the animation ends, then stays for
-    // close_hold ms (or the window's no_screen_share_cover_hold).
+    // close_hold ms (or the rule's no_screen_share_cover_hold).
     struct SLastCover {
-        PHLWINDOWREF                          win;
+        PHLWINDOWREF                          win;   // set for windows
+        PHLLSREF                              layer; // set for layers
+        bool                                  isLayer = false;
         PHLMONITORREF                         mon;
         CBox                                  box; // global logical coordinates
         SRuleValues                           rules;
@@ -487,6 +490,7 @@ namespace {
         std::chrono::steady_clock::time_point at; // frame it was last covered in
     };
     struct SClosing {
+        bool                                                 isLayer = false;
         PHLMONITORREF                                        mon;
         CBox                                                 box; // last known, global logical
         SRuleValues                                          rules;
@@ -499,8 +503,8 @@ namespace {
     std::unordered_map<uintptr_t, SLastCover> g_lastCovers;
     std::vector<SClosing>                     g_closing;
     constexpr auto                            FADE_BIND_WINDOW = std::chrono::milliseconds(150);
-    // A window last covered longer ago than this gets a closing cover only if its
-    // fade-out is found (see trackClosedWindows).
+    // Something last covered longer ago than this gets a closing cover only if its
+    // fade-out is found (see trackClosed).
     constexpr auto STALE_COVER = std::chrono::seconds(1);
 
     // The last matching rule wins, as in Hyprland itself.
@@ -576,8 +580,14 @@ namespace {
         return plane == Desktop::FADEOUT_PLANE_WINDOW_TILED || plane == Desktop::FADEOUT_PLANE_WINDOW_FLOATING || plane == Desktop::FADEOUT_PLANE_WINDOW_OVER_FULLSCREEN;
     }
 
-    // The fade-out Hyprland created for a closed window: a window fade-out on the same
-    // monitor, not taken by another closing window, nearest to where the window was.
+    bool isLayerFade(const SP<Desktop::IFadeout>& f) {
+        const auto plane = f->plane();
+        return plane == Desktop::FADEOUT_PLANE_LAYER_BACKGROUND || plane == Desktop::FADEOUT_PLANE_LAYER_BOTTOM || plane == Desktop::FADEOUT_PLANE_LAYER_TOP ||
+            plane == Desktop::FADEOUT_PLANE_LAYER_OVERLAY;
+    }
+
+    // The fade-out Hyprland created for a closed window or layer: one of the same kind
+    // on the same monitor, not taken by another closing cover, nearest to where it was.
     SP<Desktop::IFadeout> findFadeFor(const SClosing& c, const PHLMONITOR& mon) {
         const auto& state = Desktop::fadingOutState();
         if (!state)
@@ -586,7 +596,7 @@ namespace {
         double                bestDist = std::max(c.box.w, c.box.h);
         const auto            center   = c.box.middle();
         for (const auto& f : state->fadeouts()) {
-            if (!f || f->done() || !isWindowFade(f) || f->monitor().lock() != mon)
+            if (!f || f->done() || !(c.isLayer ? isLayerFade(f) : isWindowFade(f)) || f->monitor().lock() != mon)
                 continue;
             if (std::ranges::any_of(g_closing, [&](const SClosing& o) { return o.fade.lock() == f; }))
                 continue;
@@ -599,9 +609,9 @@ namespace {
         return best;
     }
 
-    // Covered windows of this monitor that disappeared since the last frame: closed
-    // ones get a closing cover, moved or hidden ones are just forgotten.
-    void trackClosedWindows(const PHLMONITOR& mon, const std::unordered_set<uintptr_t>& seen, std::chrono::steady_clock::time_point now) {
+    // Covered windows and layers of this monitor that disappeared since the last frame:
+    // closed ones get a closing cover, moved or hidden ones are just forgotten.
+    void trackClosed(const PHLMONITOR& mon, const std::unordered_set<uintptr_t>& seen, std::chrono::steady_clock::time_point now) {
         for (auto it = g_lastCovers.begin(); it != g_lastCovers.end();) {
             const auto& last = it->second;
             const auto  m    = last.mon.lock();
@@ -613,9 +623,17 @@ namespace {
                 ++it;
                 continue;
             }
-            const auto w = last.win.lock();
-            if (m && (!w || !windowMapped(w))) {
+            bool gone = false;
+            if (last.isLayer) {
+                const auto l = last.layer.lock();
+                gone         = !l || !viewVisible(l);
+            } else {
+                const auto w = last.win.lock();
+                gone         = !w || !windowMapped(w);
+            }
+            if (m && gone) {
                 SClosing c{
+                    .isLayer       = last.isLayer,
                     .mon           = mon,
                     .box           = last.box,
                     .rules         = last.rules,
@@ -624,14 +642,14 @@ namespace {
                     .bindUntil     = now + FADE_BIND_WINDOW,
                 };
                 // The stream may have had no frames for a while (static screen), so an old
-                // entry can still be a window closed just now. Keep it only if its fade-out
+                // entry can still be something closed just now. Keep it only if its fade-out
                 // is running; otherwise it closed long ago and there's nothing to hide.
                 const bool fresh = now - last.at < STALE_COVER;
                 if (!fresh)
                     c.fade = findFadeFor(c, mon);
                 if (fresh || c.fade.lock()) {
                     g_closing.push_back(std::move(c));
-                    NSC_TRACE("window closed: cover kept at %.0f,%.0f %.0fx%.0f\n", last.box.x, last.box.y, last.box.w, last.box.h);
+                    NSC_TRACE("%s closed: cover kept at %.0f,%.0f %.0fx%.0f\n", last.isLayer ? "layer" : "window", last.box.x, last.box.y, last.box.w, last.box.h);
                 }
             }
             it = g_lastCovers.erase(it);
@@ -853,8 +871,6 @@ namespace {
             g_pHyprRenderer->draw(CTexPassElement::SRenderData{.tex = tex, .box = box, .round = round, .roundingPower = roundingPower}, box);
         }
 
-        trackClosedWindows(mon, seen, now);
-        paintClosing(mon, capturePos, now);
 
         // Layers (layer-shell) with no_screen_share: same geometry as Hyprland's
         // black rect, no rounding.
@@ -869,7 +885,18 @@ namespace {
             g_animBoxes.push_back({mon, CBox{pos.x, pos.y, size.x, size.y}});
             if (ownBoxes)
                 paintPopupBoxes(l, pos - l->m_geometry.pos(), mon, capturePos);
-            const auto             rules = ruleValuesFor(l);
+            const auto rules = ruleValuesFor(l);
+            const auto key   = reinterpret_cast<uintptr_t>(l.get());
+            seen.insert(key);
+            g_lastCovers[key] = SLastCover{
+                .layer   = l,
+                .isLayer = true,
+                .mon     = mon,
+                .box     = CBox{pos.x, pos.y, size.x, size.y},
+                .rules   = rules,
+                .at      = now,
+            };
+
             const nsc_play_request req{
                 .rule_path  = rules.path ? rules.path->c_str() : nullptr,
                 .rule_speed = rules.speed ? rules.speed->c_str() : nullptr,
@@ -883,6 +910,9 @@ namespace {
             } else if (ownBoxes)
                 drawBlack(box);
         }
+
+        trackClosed(mon, seen, now);
+        paintClosing(mon, capturePos, now);
 
         paintExtraRects(mon, capturePos);
         nsc_end_frame();
@@ -1035,7 +1065,7 @@ namespace {
 namespace {
     PLUGIN_DESCRIPTION_INFO initImpl(HANDLE handle) {
         g_handle = handle;
-        const PLUGIN_DESCRIPTION_INFO info{"noshare-cover", "image or video instead of the no_screen_share black box", "gitscout-bot", "2.0.4"};
+        const PLUGIN_DESCRIPTION_INFO info{"noshare-cover", "image or video instead of the no_screen_share black box", "gitscout-bot", "2.0.5"};
 
         // A plugin built against other headers reads wrong field offsets and
         // crashes the compositor. Bail out right away: Hyprland catches the exception,
