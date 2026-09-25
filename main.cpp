@@ -17,17 +17,25 @@ extern "C" {
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <pwd.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <spawn.h>
+#include <sys/wait.h>
 #include <functional>
 #include <iomanip>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -77,12 +85,33 @@ struct SVideo {
     AVCodecContext*  dec    = nullptr;
     SwsContext*      sws    = nullptr;
     AVFrame*         frame  = nullptr;
+    AVFrame*         sw     = nullptr;
     AVPacket*        pkt    = nullptr;
     int              stream = -1;
     int64_t          durationUs = 0;
     int64_t          lastUs     = -1;
     int64_t          t0         = 0;
     bool             draining   = false;
+    bool             gpu        = false;
+    pid_t            gpuPid     = -1;
+    int              gpuFd      = -1;
+    int              frameMs    = 33;
+    int              gpuW       = 0;
+    int              gpuH       = 0;
+    bool             quit       = false;
+    bool             failed     = false;
+    std::string      path;
+    int64_t          targetUs   = -1;
+    int64_t          seen       = -1;
+    int64_t          watchMs    = 0;
+    uint64_t         gen        = 0;
+    uint64_t         uploaded   = 0;
+    int              pendingW   = 0;
+    int              pendingH   = 0;
+    std::vector<uint32_t> pending;
+    std::mutex              mu;
+    std::condition_variable cv;
+    std::thread             worker;
 };
 
 struct SGifFrame {
@@ -125,6 +154,8 @@ struct SPlay {
         return path + "\n" + std::to_string(speed) + (loop ? "\n1" : "\n0");
     }
 };
+
+extern char** environ;
 
 static SCover*                                                      active = nullptr;
 static std::unordered_map<std::string, std::unique_ptr<SCover>> g_media;
@@ -413,144 +444,495 @@ static bool loadJpeg(const std::string& path) {
 }
 
 static void closeVideo() {
-    if (active->vid.pkt)
-        av_packet_free(&active->vid.pkt);
-    if (active->vid.frame)
-        av_frame_free(&active->vid.frame);
-    if (active->vid.sws)
-        sws_freeContext(active->vid.sws);
-    if (active->vid.dec)
-        avcodec_free_context(&active->vid.dec);
-    if (active->vid.fmt)
-        avformat_close_input(&active->vid.fmt);
-    active->vid = {};
+    if (!active)
+        return;
+    auto& v = active->vid;
+    {
+        std::lock_guard lk(v.mu);
+        v.quit = true;
+    }
+    if (v.gpuPid > 0)
+        kill(v.gpuPid, SIGKILL);
+    if (v.gpuFd >= 0) {
+        close(v.gpuFd);
+        v.gpuFd = -1;
+    }
+    v.cv.notify_all();
+    if (v.worker.joinable())
+        v.worker.join();
+    if (v.gpuPid > 0) {
+        waitpid(v.gpuPid, nullptr, 0);
+        v.gpuPid = -1;
+    }
+
+    if (v.pkt)
+        av_packet_free(&v.pkt);
+    if (v.frame)
+        av_frame_free(&v.frame);
+    if (v.sw)
+        av_frame_free(&v.sw);
+    if (v.sws)
+        sws_freeContext(v.sws);
+    v.sws = nullptr;
+    if (v.dec)
+        avcodec_free_context(&v.dec);
+    if (v.fmt)
+        avformat_close_input(&v.fmt);
+
+    v.stream     = -1;
+    v.durationUs = 0;
+    v.lastUs     = -1;
+    v.t0         = 0;
+    v.draining   = false;
+    v.gpu        = false;
+    v.gpuPid     = -1;
+    v.gpuFd      = -1;
+    v.frameMs    = 33;
+    v.gpuW       = 0;
+    v.gpuH       = 0;
+    v.quit       = false;
+    v.failed     = false;
+    v.targetUs   = -1;
+    v.seen       = -1;
+    v.watchMs    = 0;
+    v.gen        = 0;
+    v.uploaded   = 0;
+    v.pendingW   = 0;
+    v.pendingH   = 0;
+    v.pending.clear();
+    v.path.clear();
 }
 
-static bool presentVideoFrame() {
-    if (!active->vid.frame || active->vid.frame->width < 1 || active->vid.frame->height < 1)
-        return false;
-
-    active->vid.sws = sws_getCachedContext(active->vid.sws, active->vid.frame->width, active->vid.frame->height, static_cast<AVPixelFormat>(active->vid.frame->format), active->gif.w, active->gif.h, AV_PIX_FMT_BGRA,
-                                     SWS_BILINEAR, nullptr, nullptr, nullptr);
-    if (!active->vid.sws)
-        return false;
-
-    uint8_t* dstData[4]  = {reinterpret_cast<uint8_t*>(active->gif.canvas.data()), nullptr, nullptr, nullptr};
-    int      dstStride[4] = {active->gif.w * 4, 0, 0, 0};
-    sws_scale(active->vid.sws, active->vid.frame->data, active->vid.frame->linesize, 0, active->vid.frame->height, dstData, dstStride);
-    uploadCover();
-    return active->tex && active->tex->ok() && active->tex->m_texID;
-}
-
-static bool pullVideoFrame() {
-    auto* st = active->vid.fmt->streams[active->vid.stream];
+static bool pullVideoFrame(SCover* self) {
+    auto& v  = self->vid;
+    auto* st = v.fmt->streams[v.stream];
     for (int spins = 0; spins < 256; ++spins) {
-        const int got = avcodec_receive_frame(active->vid.dec, active->vid.frame);
+        const int got = avcodec_receive_frame(v.dec, v.frame);
         if (got == 0) {
-            const int64_t pts = active->vid.frame->best_effort_timestamp != AV_NOPTS_VALUE ? active->vid.frame->best_effort_timestamp : active->vid.frame->pts;
-            active->vid.lastUs      = pts == AV_NOPTS_VALUE ? active->vid.lastUs + 1 : av_rescale_q(pts, st->time_base, AV_TIME_BASE_Q);
+            const int64_t pts = v.frame->best_effort_timestamp != AV_NOPTS_VALUE ? v.frame->best_effort_timestamp : v.frame->pts;
+            v.lastUs          = pts == AV_NOPTS_VALUE ? v.lastUs + 1 : av_rescale_q(pts, st->time_base, AV_TIME_BASE_Q);
             return true;
         }
         if (got != AVERROR(EAGAIN) && got != AVERROR_EOF)
             return false;
-
-        if (active->vid.draining)
+        if (v.draining)
             return false;
-
-        if (av_read_frame(active->vid.fmt, active->vid.pkt) < 0) {
-            avcodec_send_packet(active->vid.dec, nullptr);
-            active->vid.draining = true;
+        if (av_read_frame(v.fmt, v.pkt) < 0) {
+            avcodec_send_packet(v.dec, nullptr);
+            v.draining = true;
             continue;
         }
-        if (active->vid.pkt->stream_index == active->vid.stream)
-            avcodec_send_packet(active->vid.dec, active->vid.pkt);
-        av_packet_unref(active->vid.pkt);
+        if (v.pkt->stream_index == v.stream)
+            avcodec_send_packet(v.dec, v.pkt);
+        av_packet_unref(v.pkt);
     }
     return false;
 }
 
-static void seekVideo(int64_t elapsedUs) {
-    auto* st = active->vid.fmt->streams[active->vid.stream];
+static void seekVideo(SCover* self, int64_t elapsedUs) {
+    auto& v    = self->vid;
+    auto* st   = v.fmt->streams[v.stream];
     const auto pts = av_rescale_q(elapsedUs, AV_TIME_BASE_Q, st->time_base);
-    av_seek_frame(active->vid.fmt, active->vid.stream, std::max<int64_t>(pts, 0), AVSEEK_FLAG_BACKWARD);
-    avcodec_flush_buffers(active->vid.dec);
-    active->vid.lastUs   = -1;
-    active->vid.draining = false;
+    av_seek_frame(v.fmt, v.stream, std::max<int64_t>(pts, 0), AVSEEK_FLAG_BACKWARD);
+    avcodec_flush_buffers(v.dec);
+    v.lastUs   = -1;
+    v.draining = false;
+}
+
+static bool publishFrame(SCover* self) {
+    auto&     v   = self->vid;
+    AVFrame*  cpu = v.frame;
+    const int w   = cpu->width;
+    const int h = cpu->height;
+    if (w < 1 || h < 1)
+        return false;
+
+    std::vector<uint32_t> canvas(static_cast<size_t>(w) * static_cast<size_t>(h));
+    uint8_t*              dst[4]    = {reinterpret_cast<uint8_t*>(canvas.data()), nullptr, nullptr, nullptr};
+    int                   stride[4] = {w * 4, 0, 0, 0};
+    v.sws = sws_getCachedContext(v.sws, w, h, static_cast<AVPixelFormat>(cpu->format), w, h, AV_PIX_FMT_BGRA, SWS_BILINEAR, nullptr, nullptr, nullptr);
+    if (!v.sws)
+        return false;
+    sws_scale(v.sws, cpu->data, cpu->linesize, 0, h, dst, stride);
+
+    {
+        std::lock_guard lk(v.mu);
+        v.pending.swap(canvas);
+        v.pendingW = w;
+        v.pendingH = h;
+        v.gen++;
+    }
+    v.cv.notify_all();
+    return true;
+}
+
+static bool openDecoder(SCover* self, const AVCodecParameters* par, AVRational timeBase);
+
+static bool openInput(SCover* self) {
+    auto& v = self->vid;
+    if (avformat_open_input(&v.fmt, v.path.c_str(), nullptr, nullptr) < 0)
+        return false;
+    if (avformat_find_stream_info(v.fmt, nullptr) < 0)
+        return false;
+
+    const AVCodec* ignored = nullptr;
+    v.stream               = av_find_best_stream(v.fmt, AVMEDIA_TYPE_VIDEO, -1, -1, &ignored, 0);
+    if (v.stream < 0)
+        return false;
+
+    auto* st = v.fmt->streams[v.stream];
+    if (!openDecoder(self, st->codecpar, st->time_base))
+        return false;
+
+    v.frame = av_frame_alloc();
+    v.sw    = av_frame_alloc();
+    v.pkt   = av_packet_alloc();
+    if (!v.frame || !v.sw || !v.pkt)
+        return false;
+
+    int64_t duration = 0;
+    if (st->duration > 0)
+        duration = av_rescale_q(st->duration, st->time_base, AV_TIME_BASE_Q);
+    else if (v.fmt->duration > 0)
+        duration = v.fmt->duration;
+    {
+        std::lock_guard lk(v.mu);
+        v.durationUs = duration;
+    }
+    return true;
+}
+
+static const char* cuvidFor(const std::string& codec) {
+    if (codec == "av1")
+        return "av1_cuvid";
+    if (codec == "h264")
+        return "h264_cuvid";
+    if (codec == "hevc")
+        return "hevc_cuvid";
+    if (codec == "vp9")
+        return "vp9_cuvid";
+    if (codec == "vp8")
+        return "vp8_cuvid";
+    if (codec == "mpeg2video")
+        return "mpeg2_cuvid";
+    if (codec == "mpeg4")
+        return "mpeg4_cuvid";
+    if (codec == "mjpeg")
+        return "mjpeg_cuvid";
+    return nullptr;
+}
+
+static bool spawnCapture(const std::vector<std::string>& args, pid_t& pid, int& readFd) {
+    int pipefd[2] = {-1, -1};
+    if (pipe(pipefd) != 0)
+        return false;
+
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO);
+    posix_spawn_file_actions_addclose(&actions, pipefd[0]);
+    posix_spawn_file_actions_addclose(&actions, pipefd[1]);
+    posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+
+    std::vector<char*> argv;
+    argv.reserve(args.size() + 1);
+    for (const auto& arg : args)
+        argv.push_back(const_cast<char*>(arg.c_str()));
+    argv.push_back(nullptr);
+
+    const int rc = posix_spawnp(&pid, argv[0], &actions, nullptr, argv.data(), environ);
+    posix_spawn_file_actions_destroy(&actions);
+    close(pipefd[1]);
+    if (rc != 0) {
+        close(pipefd[0]);
+        pid = -1;
+        return false;
+    }
+    readFd = pipefd[0];
+    return true;
+}
+
+static void stopGpu(SVideo& v) {
+    if (v.gpuPid > 0)
+        kill(v.gpuPid, SIGKILL);
+    if (v.gpuFd >= 0) {
+        close(v.gpuFd);
+        v.gpuFd = -1;
+    }
+    if (v.gpuPid > 0) {
+        waitpid(v.gpuPid, nullptr, 0);
+        v.gpuPid = -1;
+    }
+}
+
+static bool readFull(int fd, uint8_t* dst, size_t n) {
+    size_t got = 0;
+    while (got < n) {
+        const ssize_t r = read(fd, dst + got, n - got);
+        if (r <= 0)
+            return false;
+        got += static_cast<size_t>(r);
+    }
+    return true;
+}
+
+static bool probeVideo(const std::string& path, std::string& codec, int& w, int& h, int& frameMs) {
+    pid_t pid = -1;
+    int   fd  = -1;
+    if (!spawnCapture({"/usr/bin/ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name,width,height,avg_frame_rate", "-of", "csv=p=0", path}, pid, fd))
+        return false;
+    std::string out;
+    char        buf[512];
+    ssize_t     n = 0;
+    while ((n = read(fd, buf, sizeof buf)) > 0)
+        out.append(buf, static_cast<size_t>(n));
+    close(fd);
+    waitpid(pid, nullptr, 0);
+    std::string rate;
+    std::stringstream ss(out);
+    if (!std::getline(ss, codec, ','))
+        return false;
+    std::string sw, sh;
+    if (!std::getline(ss, sw, ',') || !std::getline(ss, sh, ',') || !std::getline(ss, rate))
+        return false;
+    w = std::atoi(sw.c_str());
+    h = std::atoi(sh.c_str());
+    int num = 0, den = 1;
+    if (std::sscanf(rate.c_str(), "%d/%d", &num, &den) == 2 && num > 0 && den > 0)
+        frameMs = std::clamp(den * 1000 / num, 1, 1000);
+    else
+        frameMs = 33;
+    return w > 0 && h > 0 && cuvidFor(codec);
+}
+
+static bool startGpu(SCover* self) {
+    auto&       v = self->vid;
+    std::string codec;
+    int         w = 0, h = 0, frameMs = 33;
+    if (!probeVideo(v.path, codec, w, h, frameMs))
+        return false;
+    const size_t bytes = static_cast<size_t>(w) * static_cast<size_t>(h) * 4;
+    if (bytes == 0 || bytes > 64u * 1024u * 1024u)
+        return false;
+
+    std::vector<std::string> args = {"/usr/bin/ffmpeg", "-nostdin", "-loglevel", "error", "-hwaccel", "cuda", "-c:v", cuvidFor(codec)};
+    if (self->loop)
+        args.insert(args.end(), {"-stream_loop", "-1"});
+    args.insert(args.end(), {"-i", v.path, "-an", "-vf", "format=bgra", "-f", "rawvideo", "-pix_fmt", "bgra", "pipe:1"});
+
+    pid_t pid = -1;
+    int   fd  = -1;
+    if (!spawnCapture(args, pid, fd))
+        return false;
+
+    pollfd pfd{fd, POLLIN, 0};
+    const int pr = poll(&pfd, 1, 2000);
+    if (pr <= 0 || (pfd.revents & (POLLERR | POLLNVAL)) || ((pfd.revents & POLLHUP) && !(pfd.revents & POLLIN))) {
+        v.gpuPid = pid;
+        v.gpuFd  = fd;
+        stopGpu(v);
+        return false;
+    }
+
+    v.gpu      = true;
+    v.gpuPid   = pid;
+    v.gpuFd    = fd;
+    v.frameMs  = frameMs;
+    v.gpuW     = w;
+    v.gpuH     = h;
+    return true;
+}
+
+static void publishRaw(SCover* self, std::vector<uint32_t>&& canvas, int w, int h) {
+    auto& v = self->vid;
+    {
+        std::lock_guard lk(v.mu);
+        v.pending.swap(canvas);
+        v.pendingW = w;
+        v.pendingH = h;
+        v.gen++;
+    }
+    v.cv.notify_all();
+}
+
+static void playGpu(SCover* self) {
+    auto&        v     = self->vid;
+    const size_t bytes = static_cast<size_t>(v.gpuW) * static_cast<size_t>(v.gpuH) * 4;
+    while (true) {
+        {
+            std::unique_lock lk(v.mu);
+            v.cv.wait(lk, [&] { return v.quit || nowMs() - v.watchMs < 400; });
+            if (v.quit)
+                return;
+        }
+
+        std::vector<uint32_t> canvas(bytes / 4);
+        if (!readFull(v.gpuFd, reinterpret_cast<uint8_t*>(canvas.data()), bytes))
+            return;
+
+        publishRaw(self, std::move(canvas), v.gpuW, v.gpuH);
+
+        const double  speed  = self->speed > 0.0 ? self->speed : 1.0;
+        const int64_t waitMs = std::clamp(static_cast<int64_t>(v.frameMs / speed), int64_t{1}, int64_t{1000});
+        std::unique_lock lk(v.mu);
+        v.cv.wait_for(lk, std::chrono::milliseconds(waitMs), [&] { return v.quit; });
+        if (v.quit)
+            return;
+    }
+}
+
+static void videoWorker(SCover* self) {
+    {
+        std::lock_guard lk(self->vid.mu);
+        if (self->vid.quit)
+            return;
+    }
+    if (startGpu(self)) {
+        playGpu(self);
+        return;
+    }
+    if (!openInput(self)) {
+        std::lock_guard lk(self->vid.mu);
+        self->vid.failed = true;
+        self->vid.cv.notify_all();
+        return;
+    }
+
+    auto&   v        = self->vid;
+    int64_t epoch    = 0;
+    int64_t originUs = 0;
+    bool    clockOn  = false;
+
+    while (true) {
+        bool wokeFromIdle = false;
+        {
+            std::unique_lock lk(v.mu);
+            wokeFromIdle = nowMs() - v.watchMs >= 400;
+            v.cv.wait(lk, [&] { return v.quit || nowMs() - v.watchMs < 400; });
+            if (v.quit)
+                return;
+        }
+        if (!clockOn || wokeFromIdle) {
+            epoch    = nowMs();
+            originUs = std::max<int64_t>(v.lastUs, 0);
+            clockOn  = true;
+        }
+
+        if (!pullVideoFrame(self)) {
+            if (self->loop && v.durationUs > 0 && v.draining) {
+                seekVideo(self, 0);
+                epoch    = nowMs();
+                originUs = 0;
+                continue;
+            }
+            std::unique_lock lk(v.mu);
+            if (v.gen == 0)
+                v.failed = true;
+            v.cv.wait_for(lk, std::chrono::milliseconds(200), [&] { return v.quit; });
+            if (v.quit || v.failed)
+                return;
+            continue;
+        }
+
+        const double  speed = self->speed > 0.0 ? self->speed : 1.0;
+        const int64_t due   = epoch + static_cast<int64_t>((v.lastUs - originUs) / 1000.0 / speed);
+        const int64_t now   = nowMs();
+        if (due > now) {
+            const auto waitMs = std::min<int64_t>(due - now, 1000);
+            std::unique_lock lk(v.mu);
+            v.cv.wait_for(lk, std::chrono::milliseconds(waitMs), [&] { return v.quit; });
+            if (v.quit)
+                return;
+        } else if (now - due > 80) {
+            continue;
+        }
+
+        publishFrame(self);
+    }
+}
+
+static bool uploadPending() {
+    std::vector<uint32_t> frame;
+    int                   w = 0;
+    int                   h = 0;
+    {
+        std::lock_guard lk(active->vid.mu);
+        if (active->vid.gen == active->vid.uploaded || active->vid.pending.empty())
+            return active->tex && active->tex->ok() && active->tex->m_texID;
+        frame.swap(active->vid.pending);
+        w = active->vid.pendingW;
+        h = active->vid.pendingH;
+        active->vid.uploaded = active->vid.gen;
+    }
+    active->gif.w = w;
+    active->gif.h = h;
+    active->gif.canvas.swap(frame);
+    uploadCover();
+    return active->tex && active->tex->ok() && active->tex->m_texID;
+}
+
+static bool openDecoder(SCover* self, const AVCodecParameters* par, AVRational timeBase) {
+    auto&          v     = self->vid;
+    const AVCodec* codec = avcodec_find_decoder(par->codec_id);
+    if (!codec)
+        return false;
+    v.dec = avcodec_alloc_context3(codec);
+    if (!v.dec || avcodec_parameters_to_context(v.dec, par) < 0)
+        return false;
+    v.dec->pkt_timebase = timeBase;
+    if (avcodec_open2(v.dec, codec, nullptr) < 0)
+        return false;
+    v.gpu = false;
+    return true;
 }
 
 static bool loadVideo(const std::string& path) {
     closeVideo();
-    if (avformat_open_input(&active->vid.fmt, path.c_str(), nullptr, nullptr) < 0)
-        return false;
-    if (avformat_find_stream_info(active->vid.fmt, nullptr) < 0)
-        return false;
-
-    const AVCodec* codec = nullptr;
-    active->vid.stream         = av_find_best_stream(active->vid.fmt, AVMEDIA_TYPE_VIDEO, -1, -1, &codec, 0);
-    if (active->vid.stream < 0 || !codec)
-        return false;
-
-    active->vid.dec = avcodec_alloc_context3(codec);
-    if (!active->vid.dec || avcodec_parameters_to_context(active->vid.dec, active->vid.fmt->streams[active->vid.stream]->codecpar) < 0 || avcodec_open2(active->vid.dec, codec, nullptr) < 0)
-        return false;
-
-    active->vid.frame = av_frame_alloc();
-    active->vid.pkt   = av_packet_alloc();
-    active->gif.w     = active->vid.dec->width;
-    active->gif.h     = active->vid.dec->height;
-    if (!active->vid.frame || !active->vid.pkt || active->gif.w < 1 || active->gif.h < 1)
-        return false;
-
-    auto* st = active->vid.fmt->streams[active->vid.stream];
-    if (st->duration > 0)
-        active->vid.durationUs = av_rescale_q(st->duration, st->time_base, AV_TIME_BASE_Q);
-    else if (active->vid.fmt->duration > 0)
-        active->vid.durationUs = active->vid.fmt->duration;
-
-    active->gif.canvas.assign(static_cast<size_t>(active->gif.w) * active->gif.h, packPixel(0, 0, 0, 255));
-    if (!pullVideoFrame() || !presentVideoFrame())
-        return false;
-
-    active->kind = eKind::Video;
+    active->vid.path = path;
+    active->kind     = eKind::Video;
+    {
+        std::lock_guard lk(active->vid.mu);
+        active->vid.targetUs = 0;
+    }
+    active->vid.worker = std::thread(videoWorker, active);
     return true;
 }
 
 static void syncVideo() {
-    if (active->kind != eKind::Video || !active->vid.fmt || active->vid.stream < 0)
+    if (!active || active->kind != eKind::Video)
         return;
+
+    int64_t duration = 0;
+    {
+        std::lock_guard lk(active->vid.mu);
+        if (active->vid.failed)
+            return;
+        duration = active->vid.durationUs;
+    }
 
     const auto now = nowMs();
     if (active->vid.t0 == 0)
         active->vid.t0 = now;
 
-    const double speed = active->speed > 0.0 ? active->speed : 1.0;
+    const double speed     = active->speed > 0.0 ? active->speed : 1.0;
     int64_t      elapsedUs = static_cast<int64_t>((now - active->vid.t0) * speed * 1000.0);
     if (elapsedUs < 0)
         elapsedUs = 0;
-    if (active->vid.durationUs > 0) {
+    if (duration > 0) {
         if (active->loop)
-            elapsedUs %= active->vid.durationUs;
+            elapsedUs %= duration;
         else
-            elapsedUs = std::min(elapsedUs, active->vid.durationUs);
+            elapsedUs = std::min(elapsedUs, duration);
     }
 
-    if (active->vid.lastUs < 0 || elapsedUs + 50000 < active->vid.lastUs)
-        seekVideo(elapsedUs);
-
-    bool presented = false;
-    int  guard     = 0;
-    while (active->vid.lastUs < elapsedUs && guard++ < 48) {
-        if (!pullVideoFrame()) {
-            if (active->loop && active->vid.durationUs > 0) {
-                seekVideo(0);
-                active->vid.t0 = now;
-            }
-            break;
-        }
-        presented = true;
+    {
+        std::lock_guard lk(active->vid.mu);
+        active->vid.targetUs = elapsedUs;
+        active->vid.watchMs  = now;
     }
-    if (presented)
-        presentVideoFrame();
+    active->vid.cv.notify_all();
+    uploadPending();
 }
 
 static void closeGif() {
@@ -656,6 +1038,21 @@ static SCover* ensurePath(const SPlay& play) {
 
     auto* cover = it->second.get();
     active      = cover;
+    if (cover->kind == eKind::Video) {
+        bool failed = false;
+        {
+            std::lock_guard lk(cover->vid.mu);
+            failed = cover->vid.failed;
+        }
+        if (failed) {
+            if (cover->error.empty()) {
+                cover->error = play.path;
+                notifyOnce("noshare-cover: не открылся " + play.path);
+            }
+            return nullptr;
+        }
+        return cover;
+    }
     if (cover->kind != eKind::None)
         return (cover->tex && cover->tex->ok() && cover->tex->m_texID) ? cover : nullptr;
     if (cover->missing) {
@@ -746,7 +1143,7 @@ static void paintCovers(Screenshare::CScreenshareFrame* self) {
 
         const auto play  = playFor(w);
         auto*      cover = ensurePath(play);
-        if (!cover || !cover->tex || !cover->tex->ok() || !cover->tex->m_texID)
+        if (!cover)
             continue;
         if (synced.insert(play.key()).second) {
             active = cover;
@@ -755,6 +1152,8 @@ static void paintCovers(Screenshare::CScreenshareFrame* self) {
             else if (cover->kind == eKind::Video)
                 syncVideo();
         }
+        if (!cover->tex || !cover->tex->ok() || !cover->tex->m_texID)
+            continue;
 
         const bool dontRound = capturePos != Vector2D{} || (Fullscreen::controller() && Fullscreen::controller()->isFullscreen(w, Fullscreen::FSMODE_FULLSCREEN));
         const int  rounding  = dontRound ? 0 : static_cast<int>(std::lround(w->rounding() * mon->m_scale));

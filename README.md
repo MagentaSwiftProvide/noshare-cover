@@ -2,7 +2,7 @@
 
 [Русский](README.ru.md)
 
-Hyprland plugin. Windows with `no_screen_share` are covered by an image or a video in a screen capture. On the real screen the window stays as it is. The picture is stretched to the window.
+Hyprland plugin. Windows with `no_screen_share` are covered by an image or a video in a screen capture. On the real screen the window stays as it is. The picture is stretched to the window. Video is decoded on the GPU in a separate process, so Hyprland only uploads the finished frame.
 
 hyprpm loads the plugin. Do not also call `hl.plugin.load`.
 
