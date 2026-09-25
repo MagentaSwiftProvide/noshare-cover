@@ -591,101 +591,123 @@ APICALL EXPORT std::string PLUGIN_API_VERSION() {
     return HYPRLAND_API_VERSION;
 }
 
-APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
-    g_handle = handle;
-    const PLUGIN_DESCRIPTION_INFO info{"noshare-cover", "image or video instead of the no_screen_share black box", "vlad", "0.2"};
-
-    // A plugin built against other headers reads wrong field offsets and
-    // crashes the compositor. Bail out right away: Hyprland catches the exception,
-    // unloads the plugin and shows the reason.
-    if (std::string{__hyprland_api_get_hash()} != __hyprland_api_get_client_hash()) {
-        notify("noshare-cover: built for a different Hyprland version, rebuild it (hyprpm update)", 10000);
-        throw std::runtime_error("noshare-cover: Hyprland version mismatch");
-    }
-
-    if (!nsc_init())
-        throw std::runtime_error("noshare-cover: core init failed");
-
-    for (auto& fx : g_effects)
-        fx.id = Desktop::Rule::windowEffects()->registerEffect(fx.name);
-    for (auto& fx : g_layerEffects)
-        fx.id = Desktop::Rule::layerEffects()->registerEffect(fx.name);
-
-    g_cfgPath    = makeValue<Config::Values::CStringValue>("plugin:no_screen_share_cover:path_cover", "Default media for no_screen_share windows", Config::STRING{});
-    g_cfgLoop    = makeValue<Config::Values::CBoolValue>("plugin:no_screen_share_cover:loop", "Loop gif and video", true);
-    g_cfgSpeed   = makeValue<Config::Values::CFloatValue>("plugin:no_screen_share_cover:speed", "Playback speed for gif and video", 1.F);
-    g_cfgBackend = makeValue<Config::Values::CStringValue>("plugin:no_screen_share_cover:backend", "Video decode backend: auto, gpu or cpu", Config::STRING{"auto"});
-    g_cfgGpu     = makeValue<Config::Values::CStringValue>("plugin:no_screen_share_cover:gpu_device", "Render node for GPU decode, empty = first one", Config::STRING{});
-
-    void* target = nullptr;
-    for (const auto& match : HyprlandAPI::findFunctionsByName(handle, "renderMonitor")) {
-        if (match.demangled.find("CScreenshareFrame::renderMonitor") != std::string::npos) {
-            target = match.address;
-            break;
+namespace {
+    // Everything PLUGIN_EXIT undoes. Also run when PLUGIN_INIT throws: Hyprland then
+    // unloads the plugin with eject=true and does NOT call PLUGIN_EXIT, so anything
+    // registered before the throw (signal listeners, timers, rule effects) would be left
+    // pointing into an unloaded .so and crash the compositor on the next config reload.
+    void cleanupAll() {
+        g_onReload.reset();
+        stopHookRetry();
+        stopPump();
+        // Remove the hook first: Hyprland cleans up hooks only after PLUGIN_EXIT, and a
+        // screencast frame in between must not land in the unloaded core.
+        if (g_hook) {
+            HyprlandAPI::removeFunctionHook(g_handle, g_hook);
+            g_hook = nullptr;
         }
-    }
-    if (!target)
-        throw std::runtime_error("noshare-cover: CScreenshareFrame::renderMonitor not found");
+        // API clients (gloview) drop our pointers and may take over renderMonitor.
+        nsc_api_notify_gone();
+        g_textures.clear();
+        nsc_shutdown(); // stops and joins decode threads, clears extra rects
 
-    g_onReload = Event::bus()->m_events.config.reloaded.listen([] {
-        pushSettings();
-        drainNotifications();
-    });
-
-    g_hookTarget = target;
-    if (!tryInstallHook()) {
-        // Hooked by another plugin. Wait until it's released (newer gloview does this
-        // right after a config reload); until then no covers are drawn.
-        NSC_TRACE("renderMonitor busy, retrying\n");
-        g_hookRetry = makeShared<CEventLoopTimer>(
-            HOOK_RETRY_EVERY,
-            [](SP<CEventLoopTimer> self, void*) {
-                if (tryInstallHook()) {
-                    NSC_TRACE("renderMonitor hooked after retry\n");
-                    self->updateTimeout(std::nullopt);
-                    return;
-                }
-                self->updateTimeout(HOOK_RETRY_EVERY);
-            },
-            nullptr);
-        g_pEventLoopManager->addTimer(g_hookRetry);
+        if (const auto& fx = Desktop::Rule::windowEffects()) {
+            for (const auto& e : g_effects)
+                if (e.id)
+                    fx->unregisterEffect(e.id);
+        }
+        for (auto& e : g_effects)
+            e.id = 0;
+        if (const auto& fx = Desktop::Rule::layerEffects()) {
+            for (const auto& e : g_layerEffects)
+                if (e.id)
+                    fx->unregisterEffect(e.id);
+        }
+        for (auto& e : g_layerEffects)
+            e.id = 0;
+        g_cfgPath.reset();
+        g_cfgLoop.reset();
+        g_cfgSpeed.reset();
+        g_cfgBackend.reset();
+        g_cfgGpu.reset();
+        g_handle = nullptr;
     }
-    return info;
+} // namespace
+
+namespace {
+    PLUGIN_DESCRIPTION_INFO initImpl(HANDLE handle) {
+        g_handle = handle;
+        const PLUGIN_DESCRIPTION_INFO info{"noshare-cover", "image or video instead of the no_screen_share black box", "vlad", "0.2"};
+
+        // A plugin built against other headers reads wrong field offsets and
+        // crashes the compositor. Bail out right away: Hyprland catches the exception,
+        // unloads the plugin and shows the reason.
+        if (std::string{__hyprland_api_get_hash()} != __hyprland_api_get_client_hash()) {
+            notify("noshare-cover: built for a different Hyprland version, rebuild it (hyprpm update)", 10000);
+            throw std::runtime_error("noshare-cover: Hyprland version mismatch");
+        }
+
+        if (!nsc_init())
+            throw std::runtime_error("noshare-cover: core init failed");
+
+        for (auto& fx : g_effects)
+            fx.id = Desktop::Rule::windowEffects()->registerEffect(fx.name);
+        for (auto& fx : g_layerEffects)
+            fx.id = Desktop::Rule::layerEffects()->registerEffect(fx.name);
+
+        g_cfgPath    = makeValue<Config::Values::CStringValue>("plugin:no_screen_share_cover:path_cover", "Default media for no_screen_share windows", Config::STRING{});
+        g_cfgLoop    = makeValue<Config::Values::CBoolValue>("plugin:no_screen_share_cover:loop", "Loop gif and video", true);
+        g_cfgSpeed   = makeValue<Config::Values::CFloatValue>("plugin:no_screen_share_cover:speed", "Playback speed for gif and video", 1.F);
+        g_cfgBackend = makeValue<Config::Values::CStringValue>("plugin:no_screen_share_cover:backend", "Video decode backend: auto, gpu or cpu", Config::STRING{"auto"});
+        g_cfgGpu     = makeValue<Config::Values::CStringValue>("plugin:no_screen_share_cover:gpu_device", "Render node for GPU decode, empty = first one", Config::STRING{});
+
+        void* target = nullptr;
+        for (const auto& match : HyprlandAPI::findFunctionsByName(handle, "renderMonitor")) {
+            if (match.demangled.find("CScreenshareFrame::renderMonitor") != std::string::npos) {
+                target = match.address;
+                break;
+            }
+        }
+        if (!target)
+            throw std::runtime_error("noshare-cover: CScreenshareFrame::renderMonitor not found");
+
+        g_onReload = Event::bus()->m_events.config.reloaded.listen([] {
+            pushSettings();
+            drainNotifications();
+        });
+
+        g_hookTarget = target;
+        if (!tryInstallHook()) {
+            // Hooked by another plugin. Wait until it's released (newer gloview does this
+            // right after a config reload); until then no covers are drawn.
+            NSC_TRACE("renderMonitor busy, retrying\n");
+            g_hookRetry = makeShared<CEventLoopTimer>(
+                HOOK_RETRY_EVERY,
+                [](SP<CEventLoopTimer> self, void*) {
+                    if (tryInstallHook()) {
+                        NSC_TRACE("renderMonitor hooked after retry\n");
+                        self->updateTimeout(std::nullopt);
+                        return;
+                    }
+                    self->updateTimeout(HOOK_RETRY_EVERY);
+                },
+                nullptr);
+            g_pEventLoopManager->addTimer(g_hookRetry);
+        }
+        return info;
+    }
+} // namespace
+
+APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
+    try {
+        return initImpl(handle);
+    } catch (...) {
+        cleanupAll();
+        throw;
+    }
 }
 
-APICALL EXPORT void PLUGIN_EXIT() {
-    g_onReload.reset();
-    stopHookRetry();
-    stopPump();
-    // Remove the hook first: Hyprland cleans up hooks only after PLUGIN_EXIT, and a
-    // screencast frame in between must not land in the unloaded core.
-    if (g_hook) {
-        HyprlandAPI::removeFunctionHook(g_handle, g_hook);
-        g_hook = nullptr;
-    }
-    // API clients (gloview) drop our pointers and may take over renderMonitor.
-    nsc_api_notify_gone();
-    g_textures.clear();
-    nsc_shutdown(); // stops and joins decode threads, clears extra rects
 
-    if (const auto& fx = Desktop::Rule::windowEffects()) {
-        for (const auto& e : g_effects)
-            if (e.id)
-                fx->unregisterEffect(e.id);
-    }
-    for (auto& e : g_effects)
-        e.id = 0;
-    if (const auto& fx = Desktop::Rule::layerEffects()) {
-        for (const auto& e : g_layerEffects)
-            if (e.id)
-                fx->unregisterEffect(e.id);
-    }
-    for (auto& e : g_layerEffects)
-        e.id = 0;
-    g_cfgPath.reset();
-    g_cfgLoop.reset();
-    g_cfgSpeed.reset();
-    g_cfgBackend.reset();
-    g_cfgGpu.reset();
-    g_handle = nullptr;
+APICALL EXPORT void PLUGIN_EXIT() {
+    cleanupAll();
 }
