@@ -41,7 +41,10 @@
 
 #include "config/values/ConfigValues.hpp"
 #include "desktop/rule/Engine.hpp"
+#include "desktop/rule/layerRule/LayerRule.hpp"
 #include "desktop/rule/windowRule/WindowRule.hpp"
+#include "desktop/state/LayerState.hpp"
+#include "desktop/view/LayerSurface.hpp"
 #include "desktop/state/WindowState.hpp"
 // main (0.57-dev) разнёс окно на Window + WindowPresentation; релиз 0.56 — ещё одним классом.
 #if __has_include("desktop/view/window/Window.hpp")
@@ -52,6 +55,7 @@
 #include "desktop/view/Window.hpp"
 #endif
 #include "event/EventBus.hpp"
+#include "managers/eventLoop/EventLoopManager.hpp"
 #include "managers/eventLoop/EventLoopTimer.hpp"
 #include "managers/fullscreen/FullscreenController.hpp"
 #include "plugins/PluginAPI.hpp"
@@ -109,6 +113,24 @@ namespace {
     // после каждой перезагрузки конфига отдаём ядру настройки сразу, а не на первом
     // кадре скриншера: обложка по умолчанию успевает прогреться до захвата
     CHyprSignalListener g_onReload;
+
+    // renderMonitor может быть занят другим плагином (gloview занимает его, пока
+    // noshare-cover не загружен). Тогда не отказываемся от загрузки, а пробуем
+    // перехватить снова: gloview отпускает функцию, увидев noshare-cover после
+    // перезагрузки конфига. Таймер свой — снимается в PLUGIN_EXIT.
+    void*                  g_hookTarget = nullptr;
+    SP<CEventLoopTimer>    g_hookRetry;
+    constexpr auto         HOOK_RETRY_EVERY = std::chrono::milliseconds(500);
+
+    // Hyprland рендерит кадр захвата только когда на экране что-то изменилось.
+    // Видео в обложке само ничего не «портит», поэтому при статичном экране
+    // трансляция стояла бы или шла рывками. Пока идёт захват и есть живая
+    // анимация, помечаем области обложек изменёнными ~60 раз в секунду.
+    std::vector<CBox>                     g_animBoxes; // глобальные логические координаты
+    std::chrono::steady_clock::time_point g_lastCapture;
+    SP<CEventLoopTimer>                   g_pump;
+    constexpr auto                        PUMP_EVERY  = std::chrono::milliseconds(16);
+    constexpr auto                        PUMP_LINGER = std::chrono::seconds(1);
     CFunctionHook* g_hook   = nullptr;
 
     SP<Config::Values::CStringValue> g_cfgPath;
@@ -132,6 +154,16 @@ namespace {
         EffectId    id = 0;
     };
     std::array<SEffect, 6> g_effects = {{
+        {"no_screen_share_cover", FIELD_PATH},
+        {"no_screen_share_cover_speed", FIELD_SPEED},
+        {"no_screen_share_cover_loop", FIELD_LOOP},
+        {"no_screen_share_cover:path_cover", FIELD_PATH},
+        {"no_screen_share_cover:speed", FIELD_SPEED},
+        {"no_screen_share_cover:loop", FIELD_LOOP},
+    }};
+    // Те же поля для layer rule (бары, лаунчеры и прочий layer-shell):
+    //   hl.layer_rule({ match = { namespace = "waybar" }, no_screen_share = true, no_screen_share_cover = "~/x.png" })
+    std::array<SEffect, 6> g_layerEffects = {{
         {"no_screen_share_cover", FIELD_PATH},
         {"no_screen_share_cover_speed", FIELD_SPEED},
         {"no_screen_share_cover_loop", FIELD_LOOP},
@@ -246,21 +278,23 @@ namespace {
         std::optional<std::string> path, speed, loop;
     };
 
-    SRuleValues ruleValuesFor(const PHLWINDOW& w) {
+    // Последнее совпавшее правило побеждает, как у самого Hyprland.
+    template <class RuleT, class TargetT, size_t N>
+    SRuleValues collectRuleValues(const TargetT& target, Desktop::Rule::eRuleType type, const std::array<SEffect, N>& ids) {
         SRuleValues out;
         const auto& engine = Desktop::Rule::ruleEngine();
         if (!engine)
             return out;
         for (const auto& rule : engine->rules()) {
-            if (!rule || rule->type() != Desktop::Rule::RULE_TYPE_WINDOW)
+            if (!rule || rule->type() != type)
                 continue;
-            const auto winRule = dynamicPointerCast<Desktop::Rule::CWindowRule>(rule);
-            if (!winRule || !winRule->matches(w))
+            const auto typed = dynamicPointerCast<RuleT>(rule);
+            if (!typed || !typed->matches(target))
                 continue;
-            for (const auto& effect : winRule->effects()) {
+            for (const auto& effect : typed->effects()) {
                 if (effect.raw.empty())
                     continue;
-                for (const auto& fx : g_effects) {
+                for (const auto& fx : ids) {
                     if (!fx.id || effect.key != fx.id)
                         continue;
                     switch (fx.field) {
@@ -272,6 +306,14 @@ namespace {
             }
         }
         return out;
+    }
+
+    SRuleValues ruleValuesFor(const PHLWINDOW& w) {
+        return collectRuleValues<Desktop::Rule::CWindowRule>(w, Desktop::Rule::RULE_TYPE_WINDOW, g_effects);
+    }
+
+    SRuleValues ruleValuesFor(const PHLLS& l) {
+        return collectRuleValues<Desktop::Rule::CLayerRule>(l, Desktop::Rule::RULE_TYPE_LAYER, g_layerEffects);
     }
 
     // Обложка окна для прямоугольника другого плагина: те же правила, что и у самого окна.
@@ -325,6 +367,36 @@ namespace {
         }
     }
 
+    void pumpTick(SP<CEventLoopTimer> self, void*) {
+        const bool capturing = std::chrono::steady_clock::now() - g_lastCapture < PUMP_LINGER;
+        if (!capturing || g_animBoxes.empty() || !nsc_animating() || !g_pHyprRenderer) {
+            self->updateTimeout(std::nullopt); // трансляция кончилась — стоим
+            return;
+        }
+        for (const auto& b : g_animBoxes)
+            g_pHyprRenderer->damageBox(b);
+        self->updateTimeout(PUMP_EVERY);
+    }
+
+    void startPump() {
+        if (!g_pEventLoopManager)
+            return;
+        if (!g_pump) {
+            g_pump = makeShared<CEventLoopTimer>(PUMP_EVERY, pumpTick, nullptr);
+            g_pEventLoopManager->addTimer(g_pump);
+        } else if (!g_pump->armed())
+            g_pump->updateTimeout(PUMP_EVERY);
+    }
+
+    void stopPump() {
+        if (!g_pump)
+            return;
+        g_pump->cancel();
+        if (g_pEventLoopManager)
+            g_pEventLoopManager->removeTimer(g_pump);
+        g_pump.reset();
+    }
+
     void paintCovers(Screenshare::CScreenshareFrame* frame) {
         if (!frame || !frame->m_session || !g_pHyprRenderer) {
             NSC_TRACE("skip: frame %p session %d renderer %d\n", static_cast<void*>(frame), frame && frame->m_session ? 1 : 0, g_pHyprRenderer ? 1 : 0);
@@ -338,6 +410,8 @@ namespace {
 
         pushSettings();
         nsc_begin_frame();
+        g_animBoxes.clear();
+        g_lastCapture = std::chrono::steady_clock::now();
         NSC_TRACE("frame: monitor %s\n", mon->m_name.c_str());
 
         const auto capturePos = frame->m_session->m_captureBox.pos();
@@ -362,6 +436,7 @@ namespace {
             const auto box          = CBox{pos.x, pos.y, std::max(size.x, 5.0), std::max(size.y, 5.0)}.translate(-mon->m_position).scale(mon->m_scale).translate(-capturePos);
             if (box.w < 1 || box.h < 1)
                 continue;
+            g_animBoxes.emplace_back(pos.x, pos.y, size.x, size.y);
 
             const auto             rules = ruleValuesFor(w);
             const nsc_play_request req{
@@ -393,8 +468,36 @@ namespace {
                 box);
         }
 
+        // Слои (layer-shell) с no_screen_share: та же геометрия, что у чёрного
+        // прямоугольника Hyprland, без скругления.
+        for (const auto& l : Desktop::layerState()->layers()) {
+            if (!l || !l->m_ruleApplicator || !l->m_ruleApplicator->noScreenShare().valueOrDefault() || !l->visible())
+                continue;
+            const auto pos  = l->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
+            const auto size = l->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
+            const auto box  = CBox{pos.x, pos.y, std::max(size.x, 5.0), std::max(size.y, 5.0)}.translate(-mon->m_position).scale(mon->m_scale).translate(-capturePos);
+            if (box.w < 1 || box.h < 1)
+                continue;
+            g_animBoxes.emplace_back(pos.x, pos.y, size.x, size.y);
+            const auto             rules = ruleValuesFor(l);
+            const nsc_play_request req{
+                .rule_path  = rules.path ? rules.path->c_str() : nullptr,
+                .rule_speed = rules.speed ? rules.speed->c_str() : nullptr,
+                .rule_loop  = rules.loop ? rules.loop->c_str() : nullptr,
+            };
+            nsc_frame f{};
+            if (!nsc_resolve(&req, &f))
+                continue;
+            if (const auto tex = textureFor(f)) {
+                NSC_TRACE("layer %s: cover at %.0f,%.0f %.0fx%.0f\n", l->m_namespace.c_str(), box.x, box.y, box.w, box.h);
+                g_pHyprRenderer->draw(CTexPassElement::SRenderData{.tex = tex, .box = box}, box);
+            }
+        }
+
         paintExtraRects(mon, capturePos);
         nsc_end_frame();
+        if (!g_animBoxes.empty() && nsc_animating())
+            startPump();
         pruneTextures();
         drainNotifications();
     }
@@ -442,6 +545,34 @@ NSC_PUBLIC void noshare_cover_add_extra_rect(int monitor_id, double x, double y,
     nsc_api_add_extra_rect(monitor_id, x, y, w, h, rounding);
 }
 
+NSC_PUBLIC bool noshare_cover_set_gone_callback(uint64_t client, void (*cb)(void*), void* user) {
+    return nsc_api_set_gone_callback(client, cb, user);
+}
+
+namespace {
+    bool tryInstallHook() {
+        if (g_hook)
+            return true;
+        auto* h = HyprlandAPI::createFunctionHook(g_handle, g_hookTarget, reinterpret_cast<void*>(&hkRenderMonitor));
+        if (h && h->hook()) {
+            g_hook = h;
+            return true;
+        }
+        if (h)
+            HyprlandAPI::removeFunctionHook(g_handle, h);
+        return false;
+    }
+
+    void stopHookRetry() {
+        if (!g_hookRetry)
+            return;
+        g_hookRetry->cancel();
+        if (g_pEventLoopManager)
+            g_pEventLoopManager->removeTimer(g_hookRetry);
+        g_hookRetry.reset();
+    }
+} // namespace
+
 APICALL EXPORT std::string PLUGIN_API_VERSION() {
     return HYPRLAND_API_VERSION;
 }
@@ -463,6 +594,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     for (auto& fx : g_effects)
         fx.id = Desktop::Rule::windowEffects()->registerEffect(fx.name);
+    for (auto& fx : g_layerEffects)
+        fx.id = Desktop::Rule::layerEffects()->registerEffect(fx.name);
 
     g_cfgPath    = makeValue<Config::Values::CStringValue>("plugin:no_screen_share_cover:path_cover", "Default media for no_screen_share windows", Config::STRING{});
     g_cfgLoop    = makeValue<Config::Values::CBoolValue>("plugin:no_screen_share_cover:loop", "Loop gif and video", true);
@@ -485,20 +618,39 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         drainNotifications();
     });
 
-    g_hook = HyprlandAPI::createFunctionHook(handle, target, reinterpret_cast<void*>(&hkRenderMonitor));
-    if (!g_hook || !g_hook->hook())
-        throw std::runtime_error("noshare-cover: failed to hook renderMonitor");
+    g_hookTarget = target;
+    if (!tryInstallHook()) {
+        // Занят другим плагином. Ждём, пока отпустит (новый gloview делает это сам
+        // сразу после перезагрузки конфига); до тех пор обложки не рисуются.
+        NSC_TRACE("renderMonitor busy, retrying\n");
+        g_hookRetry = makeShared<CEventLoopTimer>(
+            HOOK_RETRY_EVERY,
+            [](SP<CEventLoopTimer> self, void*) {
+                if (tryInstallHook()) {
+                    NSC_TRACE("renderMonitor hooked after retry\n");
+                    self->updateTimeout(std::nullopt);
+                    return;
+                }
+                self->updateTimeout(HOOK_RETRY_EVERY);
+            },
+            nullptr);
+        g_pEventLoopManager->addTimer(g_hookRetry);
+    }
     return info;
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
     g_onReload.reset();
+    stopHookRetry();
+    stopPump();
     // Сначала снимаем хук: Hyprland чистит хуки уже после PLUGIN_EXIT, и кадр
     // скриншера между этим не должен попасть в выгруженное ядро.
     if (g_hook) {
         HyprlandAPI::removeFunctionHook(g_handle, g_hook);
         g_hook = nullptr;
     }
+    // Клиенты API (gloview) забывают наши указатели и могут занять renderMonitor.
+    nsc_api_notify_gone();
     g_textures.clear();
     nsc_shutdown(); // останавливает и join-ит потоки декода, чистит extra rects
 
@@ -508,6 +660,13 @@ APICALL EXPORT void PLUGIN_EXIT() {
                 fx->unregisterEffect(e.id);
     }
     for (auto& e : g_effects)
+        e.id = 0;
+    if (const auto& fx = Desktop::Rule::layerEffects()) {
+        for (const auto& e : g_layerEffects)
+            if (e.id)
+                fx->unregisterEffect(e.id);
+    }
+    for (auto& e : g_layerEffects)
         e.id = 0;
     g_cfgPath.reset();
     g_cfgLoop.reset();

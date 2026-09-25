@@ -96,6 +96,7 @@ uint64_t nsc_epoch(void);
 void     nsc_begin_frame(void);
 bool     nsc_resolve(const nsc_play_request* request, nsc_frame* out);
 void     nsc_end_frame(void);
+bool     nsc_animating(void);
 bool     nsc_cover_alive(uint64_t cover_id);
 size_t   nsc_take_notification(char* buf, size_t cap);
 size_t   nsc_extra_rects(int64_t monitor_id, nsc_extra_rect* out, size_t cap);
@@ -104,6 +105,8 @@ size_t   nsc_extra_rects(int64_t monitor_id, nsc_extra_rect* out, size_t cap);
  * обёртки noshare_cover_* в shim/plugin.cpp: весь Rust-архив линкуется
  * скрытым (--exclude-libs), чтобы не делить символы с другими плагинами. */
 uint32_t nsc_api_api_version(void);
+bool     nsc_api_set_gone_callback(uint64_t client, void (*cb)(void* user), void* user);
+void     nsc_api_notify_gone(void);
 uint64_t nsc_api_register_client(const char* name);
 void     nsc_api_unregister_client(uint64_t client);
 bool     nsc_api_set_rects(uint64_t client, int monitor_id, const noshare_cover_rect* rects, size_t count);

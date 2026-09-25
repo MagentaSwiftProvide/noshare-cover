@@ -92,6 +92,11 @@ pub struct YuvImage<'a> {
 
 const FIX: i32 = 14;
 
+/// С какого размера кадра конвертировать в несколько потоков (~1 Мп: 1280x800 и больше).
+const PARALLEL_FROM_PIXELS: usize = 1_000_000;
+/// Больше потоков не берём: композитору и декодеру тоже нужен CPU.
+const MAX_THREADS: usize = 4;
+
 /// Коэффициенты для 8-битных значений с фиксированной точкой.
 struct Coefs {
     y_off: i32,
@@ -185,41 +190,65 @@ pub fn to_bgra(img: &YuvImage<'_>) -> Option<CpuFrame> {
     let c = Coefs::new(img.matrix, img.full_range);
     let mut out = vec![0u8; w * h * 4];
 
-    // быстрый путь: 8 бит, 4:2:0, раздельные плоскости
-    if let (8, Chroma::Sub420, ChromaPlanes::Planar { u, v }) = (img.bit_depth, img.chroma, img.uv)
-    {
-        for (row, dst) in out.chunks_exact_mut(w * 4).enumerate() {
-            let yr = &img.y.data[row * img.y.stride..][..w];
-            let ur = &u.data[(row >> 1) * u.stride..][..cw];
-            let vr = &v.data[(row >> 1) * v.stride..][..cw];
-            for (x, px) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                *px = c.px(
-                    i32::from(yr[x]),
-                    i32::from(ur[x >> 1]),
-                    i32::from(vr[x >> 1]),
-                );
+    // Строки независимы: большой кадр (4K и т.п.) режем на полосы по потокам,
+    // иначе одна конвертация съедает весь бюджет кадра.
+    let convert_band = |first_row: usize, band: &mut [u8]| {
+        // быстрый путь: 8 бит, 4:2:0, раздельные плоскости
+        if let (8, Chroma::Sub420, ChromaPlanes::Planar { u, v }) =
+            (img.bit_depth, img.chroma, img.uv)
+        {
+            for (i, dst) in band.chunks_exact_mut(w * 4).enumerate() {
+                let row = first_row + i;
+                let yr = &img.y.data[row * img.y.stride..][..w];
+                let ur = &u.data[(row >> 1) * u.stride..][..cw];
+                let vr = &v.data[(row >> 1) * v.stride..][..cw];
+                for (x, px) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                    *px = c.px(
+                        i32::from(yr[x]),
+                        i32::from(ur[x >> 1]),
+                        i32::from(vr[x >> 1]),
+                    );
+                }
+            }
+        } else {
+            for (i, dst) in band.chunks_exact_mut(w * 4).enumerate() {
+                let row = first_row + i;
+                let cy = row >> sy;
+                for (x, px) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                    let yv = sample(&img.y, x, row, down);
+                    let cx = x >> sx;
+                    let (uv, vv) = match img.uv {
+                        _ if img.chroma == Chroma::Mono => (128, 128),
+                        ChromaPlanes::Planar { u, v } => {
+                            (sample(&u, cx, cy, down), sample(&v, cx, cy, down))
+                        }
+                        ChromaPlanes::Interleaved(p) => (
+                            sample(&p, cx * 2, cy, down),
+                            sample(&p, cx * 2 + 1, cy, down),
+                        ),
+                        ChromaPlanes::None => (128, 128),
+                    };
+                    *px = c.px(yv, uv, vv);
+                }
             }
         }
+    };
+
+    let threads = if w * h >= PARALLEL_FROM_PIXELS {
+        std::thread::available_parallelism().map_or(1, |n| n.get().min(MAX_THREADS))
     } else {
-        for (row, dst) in out.chunks_exact_mut(w * 4).enumerate() {
-            let cy = row >> sy;
-            for (x, px) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                let yv = sample(&img.y, x, row, down);
-                let cx = x >> sx;
-                let (uv, vv) = match img.uv {
-                    _ if img.chroma == Chroma::Mono => (128, 128),
-                    ChromaPlanes::Planar { u, v } => {
-                        (sample(&u, cx, cy, down), sample(&v, cx, cy, down))
-                    }
-                    ChromaPlanes::Interleaved(p) => (
-                        sample(&p, cx * 2, cy, down),
-                        sample(&p, cx * 2 + 1, cy, down),
-                    ),
-                    ChromaPlanes::None => (128, 128),
-                };
-                *px = c.px(yv, uv, vv);
+        1
+    };
+    if threads <= 1 {
+        convert_band(0, &mut out);
+    } else {
+        let rows_per = h.div_ceil(threads);
+        std::thread::scope(|scope| {
+            for (i, band) in out.chunks_mut(rows_per * w * 4).enumerate() {
+                let convert_band = &convert_band;
+                scope.spawn(move || convert_band(i * rows_per, band));
             }
-        }
+        });
     }
 
     Some(CpuFrame::from_bgra(img.width, img.height, Arc::from(out)))
@@ -360,5 +389,54 @@ mod tests {
             uv: ChromaPlanes::None,
         };
         assert!(to_bgra(&img).is_none());
+    }
+
+    #[test]
+    fn parallel_matches_single_thread() {
+        // 1600x900 > порога: полосы по потокам должны дать тот же результат, что построчно
+        let (w, h) = (1600usize, 900usize);
+        let yp: Vec<u8> = (0..w * h).map(|i| (i * 7 % 251) as u8).collect();
+        let (cw, ch) = (w / 2, h / 2);
+        let up: Vec<u8> = (0..cw * ch).map(|i| (i * 3 % 241) as u8).collect();
+        let vp: Vec<u8> = (0..cw * ch).map(|i| (i * 5 % 239) as u8).collect();
+        let img = YuvImage {
+            width: w as u32,
+            height: h as u32,
+            bit_depth: 8,
+            chroma: Chroma::Sub420,
+            matrix: Matrix::Bt709,
+            full_range: false,
+            y: Plane {
+                data: &yp,
+                stride: w,
+            },
+            uv: ChromaPlanes::Planar {
+                u: Plane {
+                    data: &up,
+                    stride: cw,
+                },
+                v: Plane {
+                    data: &vp,
+                    stride: cw,
+                },
+            },
+        };
+        let f = to_bgra(&img).unwrap();
+        let c = Coefs::new(Matrix::Bt709, false);
+        for &(x, y) in &[
+            (0usize, 0usize),
+            (1599, 0),
+            (800, 450),
+            (0, 899),
+            (1599, 899),
+            (777, 333),
+        ] {
+            let want = c.px(
+                i32::from(yp[y * w + x]),
+                i32::from(up[(y / 2) * cw + x / 2]),
+                i32::from(vp[(y / 2) * cw + x / 2]),
+            );
+            assert_eq!(&f.pixels[(y * w + x) * 4..][..4], &want, "({x},{y})");
+        }
     }
 }

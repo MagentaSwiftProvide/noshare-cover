@@ -60,6 +60,12 @@ typedef struct {
     bool (*set_rects)(uint64_t client, int monitor_id, const noshare_cover_rect* rects, size_t count);
     bool (*clear_client_rects)(uint64_t client);
 
+    /* v2, необязательно (NULL у старых сборок): «ухожу». Колбэк зовётся при выгрузке
+     * noshare-cover, уже после снятия его хука renderMonitor: забудьте все указатели
+     * отсюда, renderMonitor свободен. С колбэком можно сразу отпустить handle
+     * (noshare_cover_drop_handle), чтобы не мешать выгрузке noshare-cover. */
+    bool (*set_gone_callback)(uint64_t client, void (*cb)(void* user), void* user);
+
     /* v1, оставлены для совместимости */
     void (*clear_extra_rects)(void);
     void (*add_extra_rect)(int monitor_id, double x, double y, double w, double h, double rounding);
@@ -114,9 +120,19 @@ static inline int noshare_cover_bind(noshare_cover_api* api) {
     NOSHARE_COVER__SYM(unregister_client, "noshare_cover_unregister_client");
     NOSHARE_COVER__SYM(set_rects, "noshare_cover_set_rects");
     NOSHARE_COVER__SYM(clear_client_rects, "noshare_cover_clear_client_rects");
+    NOSHARE_COVER__SYM(set_gone_callback, "noshare_cover_set_gone_callback");
 #undef NOSHARE_COVER__SYM
 
     return (api->register_client && api->unregister_client && api->set_rects && api->clear_client_rects) ? 0 : 2;
+}
+
+/* Отпустить RTLD_NOLOAD-ссылку, сохранив указатели. Только вместе с set_gone_callback:
+ * без неё после выгрузки noshare-cover указатели повиснут. Держать handle дольше
+ * не надо — пока он открыт, dlclose не выгружает noshare-cover из памяти. */
+static inline void noshare_cover_drop_handle(noshare_cover_api* api) {
+    if (api->handle)
+        dlclose(api->handle);
+    api->handle = NULL;
 }
 
 static inline void noshare_cover_unbind(noshare_cover_api* api) {

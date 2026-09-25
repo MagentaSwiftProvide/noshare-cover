@@ -246,6 +246,16 @@ pub extern "C" fn nsc_end_frame() {
     })
 }
 
+/// Идёт ли анимация (видео/GIF) на обложках, показанных за последнюю секунду.
+#[unsafe(no_mangle)]
+pub extern "C" fn nsc_animating() -> bool {
+    guard(false, || {
+        state()
+            .as_ref()
+            .is_some_and(|r| r.animating(Instant::now()))
+    })
+}
+
 /// Жива ли ещё обложка (прослойка чистит кэш текстур по мёртвым id).
 #[unsafe(no_mangle)]
 pub extern "C" fn nsc_cover_alive(id: u64) -> bool {
