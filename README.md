@@ -30,6 +30,10 @@ no external processes.
 the CPU; `"gpu"` never falls back; `"cpu"` never touches the GPU. A missing library is not an
 error for the plugin: it tells you once which package to install and uses what is there.
 
+While a monitor with a video or GIF cover is being shared, the plugin damages the cover area
+~60 times a second. Hyprland only produces capture frames when the monitor repaints, so
+otherwise the cover would stall on a static monitor.
+
 ## Config
 
 ```lua
@@ -84,6 +88,10 @@ Errors (missing file, unknown format, broken video, bad `backend`) are shown onc
 Hyprland notification, not every frame. A missing file is picked up automatically as soon
 as it appears.
 
+With hyprpm you may see `unknown config key 'plugin.no_screen_share_cover...'` at startup:
+the config is read before hyprpm loads the plugin. Hyprland reloads the config after the
+plugin is loaded and the error goes away.
+
 ## API for other plugins
 
 Overlays that draw previews of windows (e.g. gloview) can ask noshare-cover to cover their
@@ -96,9 +104,13 @@ boxes too — with black or with the same cover as the window. Header-only, noth
 static noshare_cover_api nsc;
 static uint64_t          client;
 
-// PLUGIN_INIT (load noshare-cover first)
-if (noshare_cover_bind(&nsc) == 0)
+// PLUGIN_INIT (or later, once noshare-cover is there)
+if (noshare_cover_bind(&nsc) == 0) {
     client = nsc.register_client("my-overlay");
+    // optional: hear about noshare-cover unloading and don't pin it in memory
+    if (nsc.set_gone_callback && nsc.set_gone_callback(client, on_gone, NULL))
+        noshare_cover_drop_handle(&nsc);
+}
 
 // each overlay frame, per monitor — atomically replaces this client's rects there
 noshare_cover_rect r = {x, y, w, h, rounding, window_address, NOSHARE_COVER_FILL_WINDOW};
@@ -109,14 +121,22 @@ nsc.set_rects(client, monitor_id, &r, 1);
 ```
 
 Coordinates are global layout pixels (same space as window position/size). Each client owns
-its rects; one plugin can't wipe another's. The v1 functions
-`noshare_cover_clear_extra_rects` / `noshare_cover_add_extra_rect` still work unchanged.
+its rects; one plugin can't wipe another's. `on_gone` is called from noshare-cover's
+`PLUGIN_EXIT` after its `renderMonitor` hook is removed: forget every pointer into it. The v1
+functions `noshare_cover_clear_extra_rects` / `noshare_cover_add_extra_rect` still work
+unchanged.
+
+If `renderMonitor` is already hooked by another plugin (gloview does that while noshare-cover
+isn't loaded), noshare-cover doesn't refuse to load; it waits until the hook is released.
+gloview releases it as soon as it sees noshare-cover, so load order doesn't matter.
 
 ## Install
 
 ### hyprpm (Arch and others)
 
-Needs `cargo`, `nasm`, `clang` and `libva` headers to build (Arch: `pacman -S rust nasm clang libva`).
+Needs `cargo`, `nasm`, `clang` and `libva` headers to build (Arch:
+`pacman -S rust pkgconf nasm clang libva`). If something is missing, `make` says what and
+which package to install. Without VA-API: `make NSC_VAAPI=0`.
 
 ```sh
 hyprpm add https://github.com/gitscout-bot/noshare-cover
@@ -124,8 +144,9 @@ hyprpm enable noshare-cover
 hyprpm reload
 ```
 
-hyprpm builds against the running Hyprland and loads the plugin itself. Do not also call
-`hl.plugin.load`.
+No trailing `/` in the URL: with it hyprpm can't derive the repository name and installs the
+plugin outside its own directory. hyprpm builds against the running Hyprland and loads the
+plugin itself. Do not also call `hl.plugin.load`.
 
 ### Arch
 
@@ -174,6 +195,7 @@ problem is reported instead of hidden. Useful: `vainfo` (VA-API driver present),
 cargo test                 # core: config, clock, media, demux, decoders, registry, API, ABI layout
 NSC_TEST_MEDIA=dir cargo test   # + real files: h264.mp4, av1.mp4, vp9.webm (decoded and checked)
 tests/e2e/run.sh ./libnoshare-cover.so <media dir>   # live Hyprland + grim, unload/load cycles
+tests/e2e/with-gloview.sh ./libnoshare-cover.so ./gloview.so   # together with gloview
 cargo clippy --all-targets -- -D warnings
 make                       # libnoshare-cover.so (Hyprland headers via pkg-config; NSC_VAAPI=0 skips VA-API)
 nix build                  # hermetic build + tests

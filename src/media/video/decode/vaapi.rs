@@ -1,11 +1,11 @@
-//! VA-API (Intel, AMD; NVIDIA через nvidia-vaapi-driver).
+//! VA-API (Intel, AMD; NVIDIA via nvidia-vaapi-driver).
 //!
-//! Сам декод живёт в отдельной библиотеке vaapi-helper (cros-codecs поверх
-//! libva). Она вшита в плагин байтами и при первом GPU-ролике грузится из
-//! memfd через dlopen. Так libva/libgbm остаются зависимостями только
-//! помощника: нет libva — VA-API недоступен, плагин загружается и работает
-//! дальше на CPU. Помощник общий для всех декодеров и выгружается вместе с
-//! последним из них.
+//! The actual decoding lives in a separate library, vaapi-helper (cros-codecs on
+//! top of libva). It is embedded in the plugin as bytes and loaded from a memfd
+//! via dlopen on the first GPU video. That keeps libva/libgbm dependencies of the
+//! helper only: without libva, VA-API is unavailable, but the plugin still loads
+//! and keeps working on the CPU. The helper is shared by all decoders and is
+//! unloaded together with the last one.
 
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::path::Path;
@@ -46,7 +46,7 @@ struct Helper {
     _lib: Library,
 }
 
-/// Один помощник на всех, пока жив хоть один декодер.
+/// One shared helper, alive while at least one decoder is.
 static HELPER: Mutex<Weak<Helper>> = Mutex::new(Weak::new());
 
 fn helper() -> Result<Arc<Helper>, String> {
@@ -61,7 +61,7 @@ fn helper() -> Result<Arc<Helper>, String> {
 
 #[cfg(not(nsc_vaapi_embedded))]
 fn load() -> Result<Helper, String> {
-    Err("плагин собран без VA-API (make без vaapi-helper)".into())
+    Err("plugin built without VA-API (make without vaapi-helper)".into())
 }
 
 #[cfg(nsc_vaapi_embedded)]
@@ -69,7 +69,7 @@ fn load() -> Result<Helper, String> {
     use std::io::Write;
     use std::os::fd::FromRawFd;
 
-    // SAFETY: memfd_create с корректной C-строкой; fd сразу переходит во владение File.
+    // SAFETY: memfd_create with a valid C string; the fd is immediately owned by File.
     let fd = unsafe { libc::memfd_create(c"noshare-cover-vaapi".as_ptr(), libc::MFD_CLOEXEC) };
     if fd < 0 {
         return Err(format!("memfd_create: {}", std::io::Error::last_os_error()));
@@ -78,24 +78,24 @@ fn load() -> Result<Helper, String> {
     file.write_all(HELPER_SO)
         .map_err(|e| format!("memfd: {e}"))?;
     let path = format!("/proc/self/fd/{fd}");
-    // SAFETY: наш собственный помощник; конструкторов с побочными эффектами нет.
-    // После dlopen отображение живёт само, fd можно закрыть.
+    // SAFETY: our own helper; no constructors with side effects.
+    // After dlopen the mapping stays alive on its own, so the fd can be closed.
     let lib = unsafe { Library::new(&path) }.map_err(|e| {
         let e = e.to_string();
         if e.contains("libva") || e.contains("libgbm") {
-            format!("нет libva/libgbm для VA-API (поставьте libva): {e}")
+            format!("libva/libgbm not found for VA-API (install libva): {e}")
         } else {
-            format!("VA-API помощник не загрузился: {e}")
+            format!("failed to load VA-API helper: {e}")
         }
     })?;
     drop(file);
 
-    // SAFETY: сигнатуры — из vaapi-helper/src/lib.rs, ABI сверяется ниже.
+    // SAFETY: signatures come from vaapi-helper/src/lib.rs; the ABI is checked below.
     unsafe {
         let abi: unsafe extern "C" fn() -> u32 =
             *lib.get(b"nsc_vaapi_abi\0").map_err(|e| e.to_string())?;
         if abi() != HELPER_ABI {
-            return Err("VA-API помощник другой версии".into());
+            return Err("VA-API helper version mismatch".into());
         }
         Ok(Helper {
             open: *lib.get(b"nsc_vaapi_open\0").map_err(|e| e.to_string())?,
@@ -125,26 +125,26 @@ pub struct VaapiDecoder {
     handle: *mut c_void,
 }
 
-// Контекст VA используется только из потока декодера: открыт, задекожен и
-// закрыт одним владельцем, указатель наружу не уходит.
+// The VA context is used only from the decoder thread: opened, used and closed
+// by a single owner; the pointer never escapes.
 unsafe impl Send for VaapiDecoder {}
 
 impl VaapiDecoder {
     pub fn new(codec: &Codec, node: &Path) -> PipeResult<Self> {
-        let c = helper_codec(codec).ok_or_else(|| format!("VA-API не умеет {codec:?}"))?;
+        let c = helper_codec(codec).ok_or_else(|| format!("VA-API doesn't support {codec:?}"))?;
         let h = helper()?;
         let node_c = CString::new(node.as_os_str().as_encoded_bytes())
-            .map_err(|_| "путь к render node с нулём".to_string())?;
+            .map_err(|_| "render node path contains a NUL byte".to_string())?;
         let mut err = [0 as c_char; 512];
-        // SAFETY: C-строка и буфер ошибки живут весь вызов.
+        // SAFETY: the C string and error buffer outlive the call.
         let handle = unsafe { (h.open)(node_c.as_ptr(), c, err.as_mut_ptr(), err.len()) };
         if handle.is_null() {
-            // SAFETY: помощник пишет в err C-строку.
+            // SAFETY: the helper writes a C string into err.
             let msg = unsafe { std::ffi::CStr::from_ptr(err.as_ptr()) }
                 .to_string_lossy()
                 .into_owned();
             return Err(if msg.is_empty() {
-                "VA-API: не открылся".into()
+                "VA-API: failed to open".into()
             } else {
                 msg
             });
@@ -154,7 +154,7 @@ impl VaapiDecoder {
 
     fn last_error(&self) -> String {
         let mut buf = [0 as c_char; 512];
-        // SAFETY: handle жив, буфер на 512 байт.
+        // SAFETY: handle is alive; the buffer is 512 bytes.
         unsafe { (self.h.error)(self.handle, buf.as_mut_ptr(), buf.len()) };
         unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
             .to_string_lossy()
@@ -162,10 +162,10 @@ impl VaapiDecoder {
     }
 }
 
-/// Колбэк помощника: NV12 из отображённого GBM-буфера -> BGRA, сразу копией.
+/// Helper callback: NV12 from the mapped GBM buffer -> BGRA, copied immediately.
 unsafe extern "C" fn on_frame(user: *mut c_void, f: *const NscVaFrame) {
     let _ = std::panic::catch_unwind(|| {
-        // SAFETY: user — наш Vec, f — кадр на время вызова.
+        // SAFETY: user is our Vec; f is a frame valid for the duration of the call.
         let (Some(out), Some(f)) = (
             unsafe { user.cast::<Vec<DecodedFrame>>().as_mut() },
             unsafe { f.as_ref() },
@@ -176,7 +176,7 @@ unsafe extern "C" fn on_frame(user: *mut c_void, f: *const NscVaFrame) {
         if w == 0 || h == 0 || f.y.is_null() || f.uv.is_null() {
             return;
         }
-        // SAFETY: помощник гарантирует stride*строк байт на плоскость.
+        // SAFETY: the helper guarantees stride*rows bytes per plane.
         let y = unsafe { std::slice::from_raw_parts(f.y, f.y_stride * (h - 1) + w) };
         let ch = h.div_ceil(2);
         let uv =
@@ -214,7 +214,7 @@ impl Decoder for VaapiDecoder {
     fn decode(&mut self, packet: &Packet) -> PipeResult<Vec<DecodedFrame>> {
         let mut out: Vec<DecodedFrame> = Vec::new();
         let pts = u64::try_from(packet.pts.as_nanos()).unwrap_or(u64::MAX);
-        // SAFETY: пакет и out живут весь вызов, колбэк синхронный.
+        // SAFETY: the packet and out outlive the call; the callback is synchronous.
         let r = unsafe {
             (self.h.decode)(
                 self.handle,
@@ -233,7 +233,7 @@ impl Decoder for VaapiDecoder {
 
     fn flush(&mut self) -> PipeResult<Vec<DecodedFrame>> {
         let mut out: Vec<DecodedFrame> = Vec::new();
-        // SAFETY: как в decode.
+        // SAFETY: same as in decode.
         let r = unsafe { (self.h.flush)(self.handle, on_frame, (&raw mut out).cast()) };
         if r != 0 {
             return Err(self.last_error());
@@ -242,14 +242,14 @@ impl Decoder for VaapiDecoder {
     }
 
     fn reset(&mut self) {
-        // SAFETY: handle жив.
+        // SAFETY: handle is alive.
         unsafe { (self.h.reset)(self.handle) };
     }
 }
 
 impl Drop for VaapiDecoder {
     fn drop(&mut self) {
-        // SAFETY: закрываем ровно один раз; помощник выгрузится с последним Arc.
+        // SAFETY: closed exactly once; the helper is unloaded with the last Arc.
         unsafe { (self.h.close)(self.handle) };
     }
 }
@@ -270,10 +270,10 @@ mod tests {
         let e = VaapiDecoder::new(&Codec::H264, Path::new("/nonexistent/renderD999"))
             .err()
             .unwrap();
-        eprintln!("VA-API без устройства: {e}");
+        eprintln!("VA-API without a device: {e}");
         assert!(!e.is_empty());
-        // со вшитым помощником ошибка уже от него самого (memfd + dlopen + ABI прошли)
+        // with the embedded helper the error comes from the helper itself (memfd + dlopen + ABI succeeded)
         #[cfg(nsc_vaapi_embedded)]
-        assert!(e.contains("VA-API на") || e.contains("libva"), "{e}");
+        assert!(e.contains("VA-API on") || e.contains("libva"), "{e}");
     }
 }

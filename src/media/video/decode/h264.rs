@@ -1,12 +1,12 @@
-//! H.264 на CPU: системный libopenh264 через dlopen.
+//! H.264 on CPU: system libopenh264 via dlopen.
 //!
-//! Библиотеку не вшиваем (патенты H.264: Cisco платит за свои сборки, а
-//! дистрибутивы кладут её отдельным пакетом — `openh264` в Arch, `openh264` в
-//! nixpkgs). Нет библиотеки — понятная ошибка, плагин живёт дальше.
+//! The library is not bundled (H.264 patents: Cisco pays for its own builds, and
+//! distros ship it as a separate package: `openh264` in Arch, `openh264` in
+//! nixpkgs). If it's missing, we return a clear error and the plugin keeps running.
 //!
-//! Метки времени отдаём самому openh264 (uiInBsTimeStamp → uiOutYuvTimeStamp):
-//! с B-кадрами он выдаёт картинки в порядке показа, и pts едет вместе с кадром.
-//! Обёртка крейта этого не умеет, поэтому декодируем через его raw API.
+//! Timestamps go through openh264 itself (uiInBsTimeStamp → uiOutYuvTimeStamp):
+//! with B-frames it outputs pictures in display order, and pts travels with the frame.
+//! The crate's wrapper can't do this, so we decode via its raw API.
 
 use std::ptr::null_mut;
 use std::time::Duration;
@@ -21,8 +21,8 @@ use crate::frame::FrameData;
 use crate::media::video::pipeline::{DecodedFrame, Decoder, Packet, PipeResult};
 use crate::media::video::yuv::{self, Chroma, ChromaPlanes, Matrix, Plane, YuvImage};
 
-/// Где искать библиотеку: сперва по soname (ld.so сам найдёт в /usr/lib,
-/// /run/opengl-driver, NixOS-овском LD_LIBRARY_PATH), потом по полным путям.
+/// Where to look for the library: by soname first (ld.so finds it in /usr/lib,
+/// /run/opengl-driver, the NixOS LD_LIBRARY_PATH), then by full paths.
 const CANDIDATES: &[&str] = &[
     "libopenh264.so.8",
     "libopenh264.so.7",
@@ -32,7 +32,7 @@ const CANDIDATES: &[&str] = &[
     "/usr/lib/x86_64-linux-gnu/libopenh264.so",
 ];
 
-/// Переменная окружения для явного пути (например, скачанная сборка Cisco).
+/// Environment variable for an explicit path (e.g. a downloaded Cisco build).
 const ENV_PATH: &str = "NOSHARE_COVER_OPENH264";
 
 pub struct H264Decoder {
@@ -42,24 +42,24 @@ pub struct H264Decoder {
 fn load_api() -> Result<OpenH264API, String> {
     let mut tried = Vec::new();
     let explicit = std::env::var(ENV_PATH).ok();
-    // NSC_LIB_OPENH264 — абсолютный путь, вшитый при сборке (Nix: библиотека из store,
-    // на NixOS dlopen по soname её не найдёт)
+    // NSC_LIB_OPENH264: absolute path baked in at build time (Nix: library from the store;
+    // on NixOS dlopen by soname won't find it)
     for name in explicit
         .iter()
         .map(String::as_str)
         .chain(option_env!("NSC_LIB_OPENH264"))
         .chain(CANDIDATES.iter().copied())
     {
-        // SAFETY: openh264 держит стабильный C ABI для декодера в 2.x (so.6–so.8);
-        // проверка хэша крейта пропускает только сборки Cisco, дистрибутивные
-        // собраны из тех же исходников.
+        // SAFETY: openh264 keeps a stable decoder C ABI across 2.x (so.6–so.8);
+        // the crate's hash check only accepts Cisco builds; distro builds
+        // come from the same sources.
         match unsafe { OpenH264API::from_blob_path_unchecked(name) } {
             Ok(api) => return Ok(api),
             Err(e) => tried.push(format!("{name}: {e}")),
         }
     }
     Err(format!(
-        "libopenh264 не найден (поставьте пакет openh264 или задайте {ENV_PATH}); пробовал: {}",
+        "libopenh264 not found (install the openh264 package or set {ENV_PATH}); tried: {}",
         tried.join("; ")
     ))
 }
@@ -74,7 +74,7 @@ impl H264Decoder {
 
     fn remaining(&mut self) -> usize {
         let mut n: DECODER_OPTION = 0;
-        // SAFETY: GetOption пишет одно целое по указателю.
+        // SAFETY: GetOption writes one integer through the pointer.
         let r = unsafe {
             self.dec.raw_api().get_option(
                 DECODER_OPTION_NUM_OF_FRAMES_REMAINING_IN_BUFFER,
@@ -89,13 +89,13 @@ impl H264Decoder {
     }
 }
 
-/// Кадр из буфера openh264. Плоскости живут до следующего вызова декодера,
-/// поэтому переводим в BGRA сразу.
+/// Frame from the openh264 buffer. The planes live until the next decoder call,
+/// so convert to BGRA right away.
 fn convert(dst: &[*mut u8; 3], info: &SBufferInfo) -> Option<DecodedFrame> {
     if info.iBufferStatus != 1 || dst.iter().any(|p| p.is_null()) {
         return None;
     }
-    // SAFETY: при iBufferStatus == 1 в объединении лежит sSystemBuffer.
+    // SAFETY: when iBufferStatus == 1, the union holds sSystemBuffer.
     let sb = unsafe { info.UsrData.sSystemBuffer };
     let (w, h) = (
         usize::try_from(sb.iWidth).ok()?,
@@ -109,12 +109,12 @@ fn convert(dst: &[*mut u8; 3], info: &SBufferInfo) -> Option<DecodedFrame> {
         return None;
     }
     let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-    // SAFETY: openh264 гарантирует stride*строк байт на плоскость (I420).
+    // SAFETY: openh264 guarantees stride*rows bytes per plane (I420).
     let plane = |p: *mut u8, stride: usize, width: usize, rows: usize| Plane {
         data: unsafe { std::slice::from_raw_parts(p, stride * (rows - 1) + width) },
         stride,
     };
-    // openh264 отдаёт только 8-битный 4:2:0; матрицу VUI не показывает.
+    // openh264 outputs only 8-bit 4:2:0 and doesn't expose the VUI matrix.
     let yuv = YuvImage {
         width: u32::try_from(w).ok()?,
         height: u32::try_from(h).ok()?,
@@ -148,9 +148,9 @@ impl Decoder for H264Decoder {
             uiInBsTimeStamp: u64::try_from(packet.pts.as_micros()).unwrap_or(u64::MAX),
             ..Default::default()
         };
-        // SAFETY: пакет живёт весь вызов; dst/info — наши выходные буферы.
-        // Код возврата не смотрим: битый кадр просто не даст картинки, а
-        // следующий ключевой всё починит.
+        // SAFETY: the packet outlives the call; dst/info are our output buffers.
+        // The return code is ignored: a broken frame just yields no picture, and
+        // the next keyframe fixes everything.
         unsafe {
             self.dec.raw_api().decode_frame_no_delay(
                 packet.data.as_ptr(),
@@ -167,7 +167,7 @@ impl Decoder for H264Decoder {
         for _ in 0..self.remaining() {
             let mut dst = [null_mut::<u8>(); 3];
             let mut info = SBufferInfo::default();
-            // SAFETY: как в decode.
+            // SAFETY: same as in decode.
             unsafe {
                 self.dec
                     .raw_api()
@@ -179,8 +179,8 @@ impl Decoder for H264Decoder {
     }
 
     fn reset(&mut self) {
-        // После петли демуксер начинает с ключевого кадра с SPS/PPS, декодер
-        // перестраивается сам; хвост прошлого круга просто выбрасываем.
+        // After a loop the demuxer starts at a keyframe with SPS/PPS, and the decoder
+        // reconfigures itself; the tail of the previous pass is simply dropped.
         let _ = self.flush();
     }
 }

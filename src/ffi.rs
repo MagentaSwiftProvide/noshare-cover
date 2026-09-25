@@ -1,10 +1,10 @@
-//! C ABI для прослойки `shim/plugin.cpp`. Описание — `include/noshare_cover.h`.
+//! C ABI for the `shim/plugin.cpp` shim. Declared in `include/noshare_cover.h`.
 //!
-//! Правила:
-//! - ни одна паника не выходит наружу (`guard`), иначе упадёт весь Hyprland;
-//! - всё состояние — один `Registry` под мьютексом; вызовы идут из потока
-//!   рендера, мьютекс тут дешёвый и защищает от гонок с потоками декода;
-//! - указатели в `nsc_frame` живут до `nsc_end_frame` того же кадра.
+//! Rules:
+//! - no panic crosses the boundary (`guard`), otherwise all of Hyprland goes down;
+//! - all state is a single `Registry` behind a mutex; calls come from the render
+//!   thread, so the mutex is cheap and guards against races with decode threads;
+//! - pointers in `nsc_frame` are valid until `nsc_end_frame` of the same frame.
 
 use std::ffi::{CStr, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -26,7 +26,7 @@ fn guard<T>(fallback: T, f: impl FnOnce() -> T) -> T {
     catch_unwind(AssertUnwindSafe(f)).unwrap_or(fallback)
 }
 
-/// NULL и не-UTF-8 превращаются в пустую строку — это «не задано».
+/// NULL and non-UTF-8 become an empty string, meaning "not set".
 unsafe fn str_or_empty<'a>(p: *const c_char) -> &'a str {
     if p.is_null() {
         return "";
@@ -51,7 +51,7 @@ pub struct NscSettings {
     pub gpu_device: *const c_char,
 }
 
-/// Переопределения из правила окна. NULL — поле в правиле не задано.
+/// Overrides from a window rule. NULL = field not set in the rule.
 #[repr(C)]
 pub struct NscPlayRequest {
     pub rule_path: *const c_char,
@@ -78,7 +78,7 @@ pub struct NscFrame {
     pub kind: u32,
     pub width: u32,
     pub height: u32,
-    /// CPU: байт на строку, pixels — premultiplied BGRA (`fourcc` = ARGB8888).
+    /// CPU: bytes per row, pixels are premultiplied BGRA (`fourcc` = ARGB8888).
     pub stride: u32,
     pub pixels: *const u8,
     pub fourcc: u32,
@@ -105,7 +105,7 @@ impl NscFrame {
     }
 }
 
-/// Прямоугольник от другого плагина, как его рисует прослойка.
+/// Rect from another plugin, as the shim draws it.
 #[repr(C)]
 pub struct NscExtraRect {
     pub x: f64,
@@ -113,9 +113,9 @@ pub struct NscExtraRect {
     pub w: f64,
     pub h: f64,
     pub rounding: f64,
-    /// адрес окна Hyprland для заливки его обложкой, 0 — нет
+    /// Hyprland window address to fill with its cover, 0 = none
     pub window: u64,
-    /// 0 — чёрный, 1 — обложка окна `window`
+    /// 0 = black, 1 = cover of `window`
     pub fill: u32,
 }
 
@@ -127,7 +127,7 @@ pub extern "C" fn nsc_init() -> bool {
     })
 }
 
-/// Выгрузка: закрыть все источники (join потоков видео), очистить extra rects.
+/// Unload: close all sources (join video threads), clear extra rects.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsc_shutdown() {
     guard((), || {
@@ -138,7 +138,7 @@ pub extern "C" fn nsc_shutdown() {
 }
 
 /// # Safety
-/// `s` — валидный указатель на `NscSettings` на время вызова (или NULL).
+/// `s` is a valid pointer to `NscSettings` for the duration of the call (or NULL).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nsc_set_settings(s: *const NscSettings) {
     guard((), || {
@@ -159,7 +159,7 @@ pub unsafe extern "C" fn nsc_set_settings(s: *const NscSettings) {
     })
 }
 
-/// Растёт при каждом сбросе обложек. Сменилась — выкинуть все свои текстуры.
+/// Bumped on every cover reset. When it changes, drop all your textures.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsc_epoch() -> u64 {
     guard(0, || state().as_ref().map_or(0, Registry::epoch))
@@ -174,12 +174,12 @@ pub extern "C" fn nsc_begin_frame() {
     })
 }
 
-/// Обложка для окна. `false` — рисовать нечего.
+/// Cover for a window. `false` means nothing to draw.
 ///
 /// # Safety
-/// `req` и `out` — валидные указатели на время вызова. Данные в `out`
-/// (pixels, fd) действительны до `nsc_end_frame`; fd не закрывать и не
-/// передавать во владение — при импорте в EGL его нужно `dup()`.
+/// `req` and `out` are valid pointers for the duration of the call. Data in `out`
+/// (pixels, fd) is valid until `nsc_end_frame`; don't close the fd or take
+/// ownership of it: `dup()` it when importing into EGL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nsc_resolve(req: *const NscPlayRequest, out: *mut NscFrame) -> bool {
     guard(false, || {
@@ -246,7 +246,7 @@ pub extern "C" fn nsc_end_frame() {
     })
 }
 
-/// Идёт ли анимация (видео/GIF) на обложках, показанных за последнюю секунду.
+/// Whether any cover shown in the last second is animated (video/GIF).
 #[unsafe(no_mangle)]
 pub extern "C" fn nsc_animating() -> bool {
     guard(false, || {
@@ -256,7 +256,7 @@ pub extern "C" fn nsc_animating() -> bool {
     })
 }
 
-/// Жива ли ещё обложка (прослойка чистит кэш текстур по мёртвым id).
+/// Whether the cover is still alive (the shim evicts textures of dead ids).
 #[unsafe(no_mangle)]
 pub extern "C" fn nsc_cover_alive(id: u64) -> bool {
     guard(false, || {
@@ -266,11 +266,11 @@ pub extern "C" fn nsc_cover_alive(id: u64) -> bool {
     })
 }
 
-/// Забрать одно уведомление для пользователя. Возвращает длину без NUL;
-/// 0 — сообщений нет. Длинное сообщение обрезается по границе символа.
+/// Pop one user notification. Returns the length without NUL;
+/// 0 = no messages. Long messages are truncated at a char boundary.
 ///
 /// # Safety
-/// `buf` указывает на `cap` байт.
+/// `buf` points to `cap` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nsc_take_notification(buf: *mut c_char, cap: usize) -> usize {
     guard(0, || {
@@ -292,10 +292,10 @@ pub unsafe extern "C" fn nsc_take_notification(buf: *mut c_char, cap: usize) -> 
     })
 }
 
-/// Extra rects одного монитора. Возвращает общее число (может быть больше `cap`).
+/// Extra rects for one monitor. Returns the total count (may exceed `cap`).
 ///
 /// # Safety
-/// `out` указывает на `cap` элементов (или NULL при `cap == 0`).
+/// `out` points to `cap` elements (or NULL when `cap == 0`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nsc_extra_rects(
     monitor: i64,
@@ -329,7 +329,7 @@ mod tests {
     use std::ffi::CString;
     use std::mem::{offset_of, size_of};
 
-    /// Те же числа, что в static_assert заголовка include/noshare_cover.h.
+    /// Same numbers as the static_asserts in include/noshare_cover.h.
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn abi_layout() {
@@ -347,7 +347,7 @@ mod tests {
         assert_eq!(offset_of!(crate::extra::CRect, window), 40);
     }
 
-    // Всё через глобальное состояние — один сценарий целиком.
+    // Everything goes through global state, so it's one end-to-end scenario.
     #[test]
     fn full_lifecycle_through_c_abi() {
         let dir = std::env::temp_dir().join(format!("nsc-ffi-{}", std::process::id()));
@@ -388,7 +388,7 @@ mod tests {
         assert!(nsc_cover_alive(out.cover_id));
         nsc_end_frame();
 
-        // правило окна с несуществующим файлом -> нечего рисовать + уведомление
+        // window rule with a missing file -> nothing to draw + a notification
         let missing = CString::new("/definitely/missing.gif").unwrap();
         let req2 = NscPlayRequest {
             rule_path: missing.as_ptr(),
@@ -402,14 +402,14 @@ mod tests {
         let n = unsafe { nsc_take_notification(buf.as_mut_ptr(), buf.len()) };
         assert!(n > 0);
         let msg = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_str().unwrap();
-        assert!(msg.contains("нет файла"), "{msg}");
+        assert!(msg.contains("file not found"), "{msg}");
 
-        // тот же конфиг — эпоха не меняется
+        // same config: epoch stays the same
         unsafe { nsc_set_settings(&settings) };
         assert_eq!(nsc_epoch(), epoch);
 
-        // tiny buffer: обрезка по границе UTF-8 без паники
-        let long = CString::new("/нет/такого/файла/с/длинным/путём.gif").unwrap();
+        // tiny buffer: truncation at a UTF-8 boundary without panicking
+        let long = CString::new("/nicht/vorhanden/übermäßig/langer/pfad/ñandú.gif").unwrap();
         let req3 = NscPlayRequest {
             rule_path: long.as_ptr(),
             rule_speed: std::ptr::null(),

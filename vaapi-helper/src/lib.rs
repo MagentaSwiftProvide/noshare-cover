@@ -1,18 +1,18 @@
-//! VA-API-декодер для noshare-cover: тонкая C-обёртка над stateless-декодерами
-//! cros-codecs. Грузится основным плагином через dlopen (из memfd), поэтому
-//! весь интерфейс — несколько `extern "C"` функций и одна структура кадра.
+//! VA-API decoder for noshare-cover: a thin C wrapper over the cros-codecs
+//! stateless decoders. The main plugin loads it via dlopen (from a memfd), so
+//! the whole interface is a few `extern "C"` functions and one frame struct.
 //!
-//! Кадры выводятся в GBM-буферы NV12, после декода отображаются в память
-//! (gbm_bo_map сам снимает тайлинг) и отдаются колбэком без копий: указатели
-//! живут только на время вызова колбэка.
+//! Frames are decoded into NV12 GBM buffers, mapped into memory after decode
+//! (gbm_bo_map handles detiling) and passed to the callback without copying:
+//! the pointers are valid only for the duration of the callback.
 //!
-//! Ограничение cros-codecs 0.0.6: VA-API путь только 8-битный (NV12).
+//! cros-codecs 0.0.6 limitation: the VA-API path is 8-bit only (NV12).
 
 #![cfg_attr(not(target_os = "linux"), allow(unused))]
 
 use std::ffi::{c_char, c_void};
 
-/// Версия ABI между помощником и плагином.
+/// ABI version between the helper and the plugin.
 pub const ABI: u32 = 1;
 
 #[repr(C)]
@@ -28,7 +28,7 @@ pub struct NscVaFrame {
 
 pub type FrameCb = unsafe extern "C" fn(user: *mut c_void, frame: *const NscVaFrame);
 
-// Коды кодеков — совпадают с decode/vaapi.rs основного плагина.
+// Codec IDs; must match decode/vaapi.rs in the main plugin.
 pub const CODEC_H264: u32 = 1;
 pub const CODEC_HEVC: u32 = 2;
 pub const CODEC_VP8: u32 = 3;
@@ -46,14 +46,14 @@ fn write_err(buf: *mut c_char, len: usize, msg: &str) {
     }
     let bytes = msg.as_bytes();
     let n = bytes.len().min(len - 1);
-    // SAFETY: вызывающий дал буфер на len байт.
+    // SAFETY: the caller provided a buffer of len bytes.
     unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.cast::<u8>(), n);
         *buf.add(n) = 0;
     }
 }
 
-/// Паника не должна пересечь C-границу.
+/// A panic must not cross the C boundary.
 fn guard<T>(fallback: T, f: impl FnOnce() -> T) -> T {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(fallback)
 }
@@ -81,24 +81,24 @@ mod imp {
     type Frame = PooledVideoFrame<GbmVideoFrame>;
 
     pub struct Dec {
-        // порядок полей = порядок drop: декодер отпускает кадры и контекст раньше пула и дисплея
+        // field order = drop order: the decoder releases frames and context before the pool and display
         dec: DynStatelessVideoDecoder<Frame>,
         pool: FramePool<GbmVideoFrame>,
         _display: Rc<Display>,
         pub err: String,
     }
 
-    /// Сколько кадров сверх минимума держать в пуле: запас, чтобы декодер не
-    /// упирался в NotEnoughOutputBuffers, пока мы копируем кадр.
+    /// Extra frames to keep in the pool above the minimum, so the decoder doesn't
+    /// hit NotEnoughOutputBuffers while we copy a frame out.
     const POOL_HEADROOM: usize = 2;
 
     pub fn open(node: &str, codec: u32) -> Result<Dec, String> {
-        let display = Display::open_drm_display(node).map_err(|e| format!("VA-API на {node}: {e}"))?;
-        let gbm = GbmDevice::open(node).map_err(|e| format!("GBM на {node}: {e}"))?;
+        let display = Display::open_drm_display(node).map_err(|e| format!("VA-API on {node}: {e}"))?;
+        let gbm = GbmDevice::open(node).map_err(|e| format!("GBM on {node}: {e}"))?;
         let pool = FramePool::new(move |si| {
             Arc::clone(&gbm)
                 .new_frame(Fourcc::from(b"NV12"), si.display_resolution, si.coded_resolution, GbmUsage::Decode)
-                .expect("GBM: не удалось выделить кадр NV12")
+                .expect("GBM: failed to allocate an NV12 frame")
         });
         let bm = BlockingMode::Blocking;
         let d = Rc::clone(&display);
@@ -108,34 +108,34 @@ mod imp {
             CODEC_VP8 => StatelessDecoder::<Vp8, _>::new_vaapi(d, bm).map(|x| x.into_trait_object()),
             CODEC_VP9 => StatelessDecoder::<Vp9, _>::new_vaapi(d, bm).map(|x| x.into_trait_object()),
             CODEC_AV1 => StatelessDecoder::<Av1, _>::new_vaapi(d, bm).map(|x| x.into_trait_object()),
-            other => return Err(format!("неизвестный кодек {other}")),
+            other => return Err(format!("unknown codec {other}")),
         }
-        .map_err(|e| format!("VA-API не умеет этот кодек на {node}: {e}"))?;
+        .map_err(|e| format!("VA-API can't decode this codec on {node}: {e}"))?;
         Ok(Dec { dec, pool, _display: display, err: String::new() })
     }
 
     impl Dec {
-        /// Разобрать события декодера. `true` — что-то сдвинулось.
+        /// Drain decoder events. Returns `true` if anything made progress.
         fn drain(&mut self, cb: FrameCb, user: *mut c_void) -> Result<bool, String> {
             let mut progress = false;
             while let Some(ev) = self.dec.next_event() {
                 progress = true;
                 match ev {
                     DecoderEvent::FormatChanged => {
-                        let mut si = self.dec.stream_info().ok_or("формат без stream_info")?.clone();
+                        let mut si = self.dec.stream_info().ok_or("format change without stream_info")?.clone();
                         si.min_num_frames += POOL_HEADROOM;
                         self.pool.resize(&si);
                     }
                     DecoderEvent::FrameReady(h) => {
-                        h.sync().map_err(|e| format!("синхронизация кадра: {e}"))?;
+                        h.sync().map_err(|e| format!("frame sync: {e}"))?;
                         let pts_ns = h.timestamp();
                         let vf = h.video_frame();
                         let res = vf.resolution();
                         let pitch = vf.get_plane_pitch();
-                        let map = vf.map().map_err(|e| format!("отображение кадра: {e}"))?;
+                        let map = vf.map().map_err(|e| format!("frame mapping: {e}"))?;
                         let planes = map.get();
                         if planes.len() < 2 || pitch.len() < 2 {
-                            return Err("кадр без двух плоскостей NV12".into());
+                            return Err("frame lacks the two NV12 planes".into());
                         }
                         let f = NscVaFrame {
                             width: res.width,
@@ -146,7 +146,7 @@ mod imp {
                             uv_stride: pitch[1],
                             pts_ns,
                         };
-                        // SAFETY: колбэк плагина копирует данные внутри вызова.
+                        // SAFETY: the plugin callback copies the data within the call.
                         unsafe { cb(user, &f) };
                     }
                 }
@@ -160,7 +160,7 @@ mod imp {
             while off < data.len() {
                 let pool = &mut self.pool;
                 match self.dec.decode(pts_ns, &data[off..], &mut || pool.alloc()) {
-                    Ok(0) => break, // декодер ничего не взял — не крутимся вечно
+                    Ok(0) => break, // decoder consumed nothing; don't spin forever
                     Ok(n) => {
                         off += n;
                         stalls = 0;
@@ -169,7 +169,7 @@ mod imp {
                         if !self.drain(cb, user)? {
                             stalls += 1;
                             if stalls > 3 {
-                                return Err("VA-API: декодеру не хватает кадров".into());
+                                return Err("VA-API: decoder is out of output frames".into());
                             }
                         }
                     }
@@ -185,7 +185,7 @@ mod imp {
         }
 
         pub fn reset(&mut self) {
-            // после flush декодер ждёт ключевой кадр — ровно то, с чего начнётся новый круг
+            // after flush the decoder waits for a keyframe, which is exactly what the next loop starts with
             let _ = self.dec.flush();
             while self.dec.next_event().is_some() {}
         }
@@ -195,13 +195,13 @@ mod imp {
         if p.is_null() {
             return None;
         }
-        // SAFETY: вызывающий передаёт C-строку.
+        // SAFETY: the caller passes a C string.
         Some(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
     }
 
     pub fn with_dec(h: *mut c_void, f: impl FnOnce(&mut Dec) -> Result<(), String>) -> i32 {
         guard(-2, || {
-            // SAFETY: h получен из nsc_vaapi_open и ещё не закрыт.
+            // SAFETY: h comes from nsc_vaapi_open and hasn't been closed yet.
             let Some(d) = (unsafe { h.cast::<Dec>().as_mut() }) else { return -1 };
             match f(d) {
                 Ok(()) => 0,
@@ -214,17 +214,17 @@ mod imp {
     }
 }
 
-/// Открыть декодер. NULL — ошибка, текст в `err`.
+/// Open a decoder. Returns NULL on error, with the message in `err`.
 ///
 /// # Safety
-/// `node` — C-строка, `err` — буфер на `err_len` байт или NULL.
+/// `node` is a C string; `err` is a buffer of `err_len` bytes or NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nsc_vaapi_open(node: *const c_char, codec: u32, err: *mut c_char, err_len: usize) -> *mut c_void {
     #[cfg(target_os = "linux")]
     {
         guard(std::ptr::null_mut(), || {
             let Some(node) = imp::cstr(node) else {
-                write_err(err, err_len, "нет render node");
+                write_err(err, err_len, "no render node");
                 return std::ptr::null_mut();
             };
             match imp::open(&node, codec) {
@@ -239,13 +239,13 @@ pub unsafe extern "C" fn nsc_vaapi_open(node: *const c_char, codec: u32, err: *m
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (node, codec);
-        write_err(err, err_len, "VA-API есть только на Linux");
+        write_err(err, err_len, "VA-API is Linux-only");
         std::ptr::null_mut()
     }
 }
 
 /// # Safety
-/// `h` — от `nsc_vaapi_open`; `data` — `len` байт; `cb` зовётся синхронно.
+/// `h` comes from `nsc_vaapi_open`; `data` is `len` bytes; `cb` is called synchronously.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nsc_vaapi_decode(h: *mut c_void, data: *const u8, len: usize, pts_ns: u64, cb: FrameCb, user: *mut c_void) -> i32 {
     #[cfg(target_os = "linux")]
@@ -253,7 +253,7 @@ pub unsafe extern "C" fn nsc_vaapi_decode(h: *mut c_void, data: *const u8, len: 
         if data.is_null() {
             return 0;
         }
-        // SAFETY: см. контракт функции.
+        // SAFETY: see the function contract.
         let bytes = unsafe { std::slice::from_raw_parts(data, len) };
         imp::with_dec(h, |d| d.decode(bytes, pts_ns, cb, user))
     }
@@ -265,7 +265,7 @@ pub unsafe extern "C" fn nsc_vaapi_decode(h: *mut c_void, data: *const u8, len: 
 }
 
 /// # Safety
-/// Как у `nsc_vaapi_decode`.
+/// Same as `nsc_vaapi_decode`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nsc_vaapi_flush(h: *mut c_void, cb: FrameCb, user: *mut c_void) -> i32 {
     #[cfg(target_os = "linux")]
@@ -280,7 +280,7 @@ pub unsafe extern "C" fn nsc_vaapi_flush(h: *mut c_void, cb: FrameCb, user: *mut
 }
 
 /// # Safety
-/// `h` — от `nsc_vaapi_open`.
+/// `h` comes from `nsc_vaapi_open`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nsc_vaapi_reset(h: *mut c_void) {
     #[cfg(target_os = "linux")]
@@ -292,14 +292,14 @@ pub unsafe extern "C" fn nsc_vaapi_reset(h: *mut c_void) {
     let _ = h;
 }
 
-/// Текст последней ошибки. Возвращает длину без нуля.
+/// Text of the last error. Returns its length without the NUL terminator.
 ///
 /// # Safety
-/// `h` — от `nsc_vaapi_open`, `buf` — `len` байт.
+/// `h` comes from `nsc_vaapi_open`; `buf` is `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nsc_vaapi_error(h: *mut c_void, buf: *mut c_char, len: usize) -> usize {
     guard(0, || {
-        // SAFETY: см. контракт.
+        // SAFETY: see the contract.
         #[cfg(target_os = "linux")]
         if let Some(d) = unsafe { h.cast::<imp::Dec>().as_ref() } {
             write_err(buf, len, &d.err);
@@ -311,13 +311,13 @@ pub unsafe extern "C" fn nsc_vaapi_error(h: *mut c_void, buf: *mut c_char, len: 
 }
 
 /// # Safety
-/// `h` — от `nsc_vaapi_open`, закрывается один раз.
+/// `h` comes from `nsc_vaapi_open` and is closed exactly once.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nsc_vaapi_close(h: *mut c_void) {
     guard((), || {
         #[cfg(target_os = "linux")]
         if !h.is_null() {
-            // SAFETY: Box из nsc_vaapi_open.
+            // SAFETY: the Box from nsc_vaapi_open.
             drop(unsafe { Box::from_raw(h.cast::<imp::Dec>()) });
         }
         let _ = h;

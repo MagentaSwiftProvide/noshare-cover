@@ -1,13 +1,13 @@
-//! Выбор демуксера и декодера под файл и настройки.
+//! Picks the demuxer and decoder for a file and settings.
 //!
-//! Порядок: `backend = gpu` — только VA-API, ошибка если нельзя;
-//! `cpu` — только программный; `auto` — VA-API, если GPU есть и умеет кодек,
-//! иначе программный. Каждый отказ объясняется текстом, который уйдёт
-//! пользователю, а не теряется молча.
+//! Order: `backend = gpu`: VA-API only, error if unavailable;
+//! `cpu`: software only; `auto`: VA-API if a GPU is present and supports the codec,
+//! otherwise software. Every rejection comes with a reason that is shown
+//! to the user instead of being silently dropped.
 //!
-//! Статус: сами демуксеры (mp4/mov, webm/mkv) и декодеры (VA-API, dav1d, openh264)
-//! подключаются следующим шагом — они требуют Linux-машины для проверки. Каркас,
-//! часы, поток и жизненный цикл готовы и покрыты тестами (см. pipeline.rs, mod.rs).
+//! Status: the demuxers (mp4/mov, webm/mkv) and decoders (VA-API, dav1d, openh264)
+//! come in the next step; they need a Linux machine to test. The scaffolding,
+//! clock, thread and lifecycle are done and covered by tests (see pipeline.rs, mod.rs).
 
 use std::path::Path;
 
@@ -50,8 +50,8 @@ fn open_decoder(codec: &Codec, settings: &Settings) -> Result<Box<dyn Decoder>, 
     }
 }
 
-/// GPU-декодер для render node. NVIDIA — сначала NVDEC напрямую (драйвер
-/// сам разбирает поток), потом VA-API (nvidia-vaapi-driver); Intel/AMD — VA-API.
+/// GPU decoder for a render node. NVIDIA: NVDEC directly first (the driver
+/// parses the stream itself), then VA-API (nvidia-vaapi-driver); Intel/AMD: VA-API.
 fn open_hw(codec: &Codec, node: &Path) -> Result<Box<dyn Decoder>, String> {
     let mut reasons: Vec<String> = Vec::new();
 
@@ -70,7 +70,7 @@ fn open_hw(codec: &Codec, node: &Path) -> Result<Box<dyn Decoder>, String> {
     }
     #[cfg(not(all(feature = "vaapi", target_os = "linux")))]
     reasons.push(format!(
-        "VA-API недоступен в этой сборке ({codec:?}, {})",
+        "VA-API is not available in this build ({codec:?}, {})",
         node.display()
     ));
 
@@ -78,7 +78,7 @@ fn open_hw(codec: &Codec, node: &Path) -> Result<Box<dyn Decoder>, String> {
 }
 
 fn open_sw(codec: &Codec) -> Result<Box<dyn Decoder>, String> {
-    // Кадры YUV -> premultiplied BGRA одним проходом (yuv.rs).
+    // YUV frames -> premultiplied BGRA in a single pass (yuv.rs).
     match codec {
         #[cfg(feature = "cpu-av1")]
         Codec::Av1 => Ok(Box::new(super::decode::av1::Av1Decoder::new()?)),
@@ -87,7 +87,7 @@ fn open_sw(codec: &Codec) -> Result<Box<dyn Decoder>, String> {
         #[cfg(feature = "cpu-vpx")]
         Codec::Vp8 | Codec::Vp9 => Ok(Box::new(super::decode::vpx::VpxDecoder::new(codec)?)),
         _ => Err(format!(
-            "программный декодер для {codec:?} ещё не подключён"
+            "software decoder for {codec:?} is not wired up yet"
         )),
     }
 }
@@ -142,8 +142,8 @@ mod real {
         };
         let mut p = match open_pipeline(&path, true, &s) {
             Ok(p) => p,
-            Err(e) if e.contains("не найден") => {
-                eprintln!("{file}: {e} — пропуск");
+            Err(e) if e.contains("not found") => {
+                eprintln!("{file}: {e} — skipping");
                 return;
             }
             Err(e) => panic!("{file}: {e}"),
@@ -152,14 +152,14 @@ mod real {
         let mut last = None;
         for n in 0..400 {
             let Next::Frame(f) = p.next_frame().unwrap() else {
-                panic!("петля не должна кончаться")
+                panic!("loop must not end")
             };
             #[allow(irrefutable_let_patterns)]
             let FrameData::Cpu(c) = &f.data else {
-                panic!("ждали CPU-кадр")
+                panic!("expected a CPU frame")
             };
             assert_eq!((c.width, c.height), (640, 360));
-            // NSC_DUMP=каталог — сохранить 60-й кадр в PNG, чтобы глазами проверить цвета
+            // NSC_DUMP=dir: save frame 60 as PNG to check the colors by eye
             if let (60, Some(d)) = (n, std::env::var_os("NSC_DUMP")) {
                 let rgba: Vec<u8> = c
                     .pixels
@@ -178,7 +178,7 @@ mod real {
             if let Some(prev) = last {
                 assert!(
                     f.pts > prev,
-                    "{file}: pts идут вперёд даже через петлю: {prev:?} -> {:?}",
+                    "{file}: pts keep increasing across the loop: {prev:?} -> {:?}",
                     f.pts
                 );
             }

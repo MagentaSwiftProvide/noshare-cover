@@ -1,7 +1,7 @@
-//! Часы воспроизведения: позиция в ролике с учётом скорости и петли.
+//! Playback clock: position in the clip, accounting for speed and looping.
 //!
-//! Время берём из монотонных часов вызывающего (кадры композитора), поэтому
-//! все функции чистые и тестируются без sleep.
+//! Time comes from the caller's monotonic clock (compositor frames), so all
+//! functions are pure and testable without sleep.
 
 use std::time::{Duration, Instant};
 
@@ -21,10 +21,10 @@ impl PlaybackClock {
         }
     }
 
-    /// Позиция на момент `now`. Первый вызов запускает часы.
+    /// Position at `now`. The first call starts the clock.
     ///
-    /// `duration == None` — длина неизвестна (живой поток): просто время с учётом
-    /// скорости. Без петли позиция упирается в последний момент ролика.
+    /// `duration == None` means unknown length (live stream): just elapsed time
+    /// scaled by speed. Without looping, the position clamps to the clip's last moment.
     pub fn position(&mut self, now: Instant, duration: Option<Duration>) -> Duration {
         let started = *self.started.get_or_insert(now);
         let raw = now.saturating_duration_since(started).mul_f64(self.speed);

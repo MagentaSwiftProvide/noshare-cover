@@ -1,9 +1,9 @@
-//! Демуксеры: MP4/MOV (re_mp4) и WebM/MKV (matroska-demuxer), оба на Rust.
+//! Demuxers: MP4/MOV (re_mp4) and WebM/MKV (matroska-demuxer), both pure Rust.
 //!
-//! Файл целиком в память не читается: из MP4 берём только индекс (moov), сами
-//! сэмплы читаем с диска по смещениям. На выходе пакеты уже в том виде, какой
-//! ждут декодеры: H.264/HEVC — Annex-B с параметрами перед ключевыми кадрами,
-//! AV1/VP8/VP9 — как в контейнере.
+//! The file is never read into memory whole: from MP4 we take only the index (moov);
+//! samples are read from disk by offset. Output packets are already in the form
+//! decoders expect: H.264/HEVC as Annex-B with parameter sets before keyframes,
+//! AV1/VP8/VP9 as stored in the container.
 
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
@@ -13,11 +13,11 @@ use std::time::Duration;
 use super::bitstream::{self, NalConfig};
 use super::pipeline::{Codec, Demuxer, Packet, PipeResult, VideoInfo};
 
-/// Как превратить сэмпл контейнера в пакет для декодера.
+/// How to turn a container sample into a decoder packet.
 enum Framing {
     /// AVCC/HVCC → Annex-B
     Nal(NalConfig),
-    /// как есть (AV1, VP8, VP9)
+    /// as is (AV1, VP8, VP9)
     Raw,
 }
 
@@ -27,11 +27,11 @@ impl Framing {
             Codec::H264 => config
                 .and_then(bitstream::parse_avcc)
                 .map(Framing::Nal)
-                .ok_or_else(|| "нет или битый avcC у H.264".into()),
+                .ok_or_else(|| "H.264 avcC missing or broken".into()),
             Codec::Hevc => config
                 .and_then(bitstream::parse_hvcc)
                 .map(Framing::Nal)
-                .ok_or_else(|| "нет или битый hvcC у HEVC".into()),
+                .ok_or_else(|| "HEVC hvcC missing or broken".into()),
             _ => Ok(Framing::Raw),
         }
     }
@@ -55,8 +55,8 @@ enum Container {
     Matroska,
 }
 
-/// Контейнер по первым байтам файла: расширениям верить нельзя (mp4, названный .mkv,
-/// встречается постоянно). Не узнали — по расширению.
+/// Detect the container from the first bytes: extensions can't be trusted (an mp4 named .mkv
+/// is common). If unrecognized, fall back to the extension.
 fn sniff(path: &Path) -> PipeResult<Container> {
     let mut head = [0u8; 12];
     let n = File::open(path)
@@ -82,7 +82,7 @@ fn sniff(path: &Path) -> PipeResult<Container> {
     match ext.as_str() {
         "mp4" | "m4v" | "mov" => Ok(Container::Mp4),
         "webm" | "mkv" => Ok(Container::Matroska),
-        other => Err(format!("контейнер .{other} не поддерживается")),
+        other => Err(format!("container .{other} is not supported")),
     }
 }
 
@@ -114,7 +114,7 @@ impl Mp4Demux {
             .tracks()
             .values()
             .find(|t| t.kind == Some(re_mp4::TrackKind::Video))
-            .ok_or("в MP4 нет видеодорожки")?;
+            .ok_or("no video track in MP4")?;
 
         let codec = codec_from_mp4(track, &mp4);
         let config = track.raw_codec_config(&mp4);
@@ -155,7 +155,7 @@ impl Demuxer for Mp4Demux {
     }
 
     fn next_packet(&mut self) -> PipeResult<Option<Packet>> {
-        // битые сэмплы пропускаем, но не бесконечно
+        // skip broken samples, but not indefinitely
         while let Some(s) = self.samples.get(self.next).copied() {
             self.next += 1;
             if s.size == 0 || s.size > 256 * 1024 * 1024 {
@@ -167,7 +167,7 @@ impl Demuxer for Mp4Demux {
             let mut data = vec![0u8; s.size as usize];
             self.file
                 .read_exact(&mut data)
-                .map_err(|e| format!("MP4 сэмпл {}: {e}", s.id))?;
+                .map_err(|e| format!("MP4 sample {}: {e}", s.id))?;
             let pts_units = s.composition_timestamp.max(0) as f64;
             let pts = if s.timescale > 0 {
                 Duration::from_secs_f64(pts_units / s.timescale as f64)
@@ -192,7 +192,7 @@ impl Demuxer for Mp4Demux {
 pub struct MkvDemux {
     mkv: matroska_demuxer::MatroskaFile<BufReader<File>>,
     track: u64,
-    /// наносекунд в единице времени Matroska
+    /// nanoseconds per Matroska time unit
     scale_ns: u64,
     info: VideoInfo,
     framing: Framing,
@@ -209,7 +209,7 @@ impl MkvDemux {
             .tracks()
             .iter()
             .find(|t| t.track_type() == matroska_demuxer::TrackType::Video)
-            .ok_or("в MKV нет видеодорожки")?;
+            .ok_or("no video track in MKV")?;
 
         let codec = codec_from_mkv(entry.codec_id());
         let framing = Framing::for_codec(&codec, entry.codec_private())?;
@@ -270,7 +270,7 @@ impl Demuxer for MkvDemux {
                 continue;
             }
             let pts = Duration::from_nanos(self.frame.timestamp.saturating_mul(self.scale_ns));
-            // is_keyframe известен только для SimpleBlock; иначе считаем ключевым первый кадр
+            // is_keyframe is only known for SimpleBlock; otherwise treat the first frame as a keyframe
             let key = self.frame.is_keyframe.unwrap_or(false);
             let data = std::mem::take(&mut self.frame.data);
             if let Some(p) = self.framing.packet(data, pts, key) {
@@ -302,11 +302,11 @@ mod tests {
         assert!(open(Path::new("/nonexistent/x.avi")).is_err());
     }
 
-    /// Настоящие ролики из `NSC_TEST_MEDIA` (10 с, 640x360). Нет каталога — тест пропускается.
+    /// Real clips from `NSC_TEST_MEDIA` (10 s, 640x360). Without the directory the test is skipped.
     #[test]
     fn real_files() {
         let Some(dir) = std::env::var_os("NSC_TEST_MEDIA").map(std::path::PathBuf::from) else {
-            eprintln!("NSC_TEST_MEDIA не задан — пропуск");
+            eprintln!("NSC_TEST_MEDIA not set — skipping");
             return;
         };
         for (name, codec) in [
@@ -317,7 +317,7 @@ mod tests {
         ] {
             let path = dir.join(name);
             if !path.exists() {
-                eprintln!("{name}: нет файла — пропуск");
+                eprintln!("{name}: file missing — skipping");
                 continue;
             }
             let mut d = open(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -335,14 +335,14 @@ mod tests {
                     first_key = Some(p.keyframe);
                     if codec == Codec::H264 {
                         assert_eq!(&p.data[..4], &[0, 0, 0, 1], "{name}: Annex-B");
-                        assert_eq!(p.data[4] & 0x1f, 7, "{name}: SPS перед ключевым кадром");
+                        assert_eq!(p.data[4] & 0x1f, 7, "{name}: SPS before keyframe");
                     }
                 }
                 assert!(!p.data.is_empty());
                 max_pts = max_pts.max(p.pts);
                 count += 1;
             }
-            eprintln!("{name}: {count} пакетов, max pts {max_pts:?}, {dur:.2} c");
+            eprintln!("{name}: {count} packets, max pts {max_pts:?}, {dur:.2} s");
             assert!(count > 200, "{name}: {count} packets");
             assert!(max_pts.as_secs_f64() > 9.0, "{name}: pts {max_pts:?}");
             if name.ends_with(".mp4") {
@@ -359,9 +359,9 @@ mod tests {
         }
     }
 
-    /// Официальный тестовый файл Matroska (test1.mkv: MPEG-4 Part 2 в MKV).
-    /// Кодек у нас не поддерживается — демуксер должен честно сказать Other и
-    /// при этом прочитать весь файл (кластеры, BlockGroup, лейсинг).
+    /// Official Matroska test file (test1.mkv: MPEG-4 Part 2 in MKV).
+    /// We don't support the codec, so the demuxer must honestly report Other and
+    /// still read the whole file (clusters, BlockGroup, lacing).
     #[test]
     fn real_matroska_file() {
         let Some(path) = std::env::var_os("NSC_TEST_MEDIA")
@@ -386,7 +386,7 @@ mod tests {
             keys += usize::from(p.keyframe);
             n += 1;
         }
-        eprintln!("test1.mkv: {n} пакетов, ключевых {keys}, {:?}", d.info());
+        eprintln!("test1.mkv: {n} packets, {keys} keyframes, {:?}", d.info());
         assert!(n > 100 && keys > 0);
     }
 

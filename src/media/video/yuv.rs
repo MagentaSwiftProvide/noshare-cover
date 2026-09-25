@@ -1,9 +1,9 @@
-//! YUV → premultiplied BGRA (видео непрозрачное, так что просто BGRA с A=255).
+//! YUV → premultiplied BGRA (video is opaque, so it's plain BGRA with A=255).
 //!
-//! Общий для всех CPU-путей: dav1d/rav1d (I420/I422/I444/I400, 8–12 бит),
-//! openh264 (I420), libvpx (I420/I444), NVDEC с копией в память (NV12).
-//! Целочисленная арифметика с фиксированной точкой (14 бит), быстрый путь для
-//! самого частого случая — 8 бит 4:2:0.
+//! Shared by all CPU paths: dav1d/rav1d (I420/I422/I444/I400, 8–12 bit),
+//! openh264 (I420), libvpx (I420/I444), NVDEC with a copy to system memory (NV12).
+//! Fixed-point integer math (14 bit), with a fast path for
+//! the most common case: 8-bit 4:2:0.
 
 use std::sync::Arc;
 
@@ -17,7 +17,7 @@ pub enum Matrix {
 }
 
 impl Matrix {
-    /// Эвристика, когда поток не говорит сам: HD и выше — 709, остальное — 601.
+    /// Heuristic when the stream doesn't say: HD and up is 709, everything else 601.
     pub fn guess(height: u32) -> Self {
         if height >= 720 {
             Matrix::Bt709
@@ -26,7 +26,7 @@ impl Matrix {
         }
     }
 
-    /// Коэффициенты (Kr, Kb).
+    /// Coefficients (Kr, Kb).
     fn kr_kb(self) -> (f64, f64) {
         match self {
             Matrix::Bt601 => (0.299, 0.114),
@@ -38,13 +38,13 @@ impl Matrix {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Chroma {
-    /// 4:2:0 — chroma на каждые 2x2 пикселя
+    /// 4:2:0: one chroma sample per 2x2 pixels
     Sub420,
-    /// 4:2:2 — chroma на каждые 2x1
+    /// 4:2:2: one chroma sample per 2x1
     Sub422,
     /// 4:4:4
     Full,
-    /// только яркость
+    /// luma only
     Mono,
 }
 
@@ -58,22 +58,22 @@ impl Chroma {
     }
 }
 
-/// Плоскость: байты + шаг строки в байтах.
+/// Plane: bytes + row stride in bytes.
 #[derive(Clone, Copy)]
 pub struct Plane<'a> {
     pub data: &'a [u8],
     pub stride: usize,
 }
 
-/// Как лежат цветоразностные компоненты.
+/// Chroma plane layout.
 #[derive(Clone, Copy)]
 pub enum ChromaPlanes<'a> {
-    /// U и V отдельно (I420/I422/I444)
+    /// separate U and V planes (I420/I422/I444)
     Planar {
         u: Plane<'a>,
         v: Plane<'a>,
     },
-    /// UV вперемешку (NV12)
+    /// interleaved UV (NV12)
     Interleaved(Plane<'a>),
     None,
 }
@@ -81,7 +81,7 @@ pub enum ChromaPlanes<'a> {
 pub struct YuvImage<'a> {
     pub width: u32,
     pub height: u32,
-    /// 8, 10 или 12. Больше 8 — отсчёты u16 little-endian.
+    /// 8, 10 or 12. Above 8, samples are u16 little-endian.
     pub bit_depth: u32,
     pub chroma: Chroma,
     pub matrix: Matrix,
@@ -92,12 +92,12 @@ pub struct YuvImage<'a> {
 
 const FIX: i32 = 14;
 
-/// С какого размера кадра конвертировать в несколько потоков (~1 Мп: 1280x800 и больше).
+/// Frame size at which conversion goes multithreaded (~1 MP: 1280x800 and up).
 const PARALLEL_FROM_PIXELS: usize = 1_000_000;
-/// Больше потоков не берём: композитору и декодеру тоже нужен CPU.
+/// No more threads than this: the compositor and decoder need CPU too.
 const MAX_THREADS: usize = 4;
 
-/// Коэффициенты для 8-битных значений с фиксированной точкой.
+/// Fixed-point coefficients for 8-bit values.
 struct Coefs {
     y_off: i32,
     y_mul: i32,
@@ -111,7 +111,7 @@ impl Coefs {
     fn new(matrix: Matrix, full: bool) -> Self {
         let (kr, kb) = matrix.kr_kb();
         let kg = 1.0 - kr - kb;
-        // масштаб яркости и цветности для limited range
+        // luma and chroma scale for limited range
         let (ys, cs, yo) = if full {
             (1.0, 1.0, 0)
         } else {
@@ -153,12 +153,12 @@ fn sample(p: &Plane<'_>, x: usize, y: usize, shift: u32) -> i32 {
     }
 }
 
-/// Проверка, что плоскости действительно вмещают картинку (иначе вернём None, а не панику).
+/// Checks that the planes actually fit the image (so we return None instead of panicking).
 fn plane_ok(p: &Plane<'_>, w: usize, h: usize, bytes_per: usize) -> bool {
     h == 0 || (p.stride >= w * bytes_per && p.data.len() >= p.stride * (h - 1) + w * bytes_per)
 }
 
-/// Конвертация. `None` — неверные размеры плоскостей.
+/// Conversion. `None` means invalid plane sizes.
 pub fn to_bgra(img: &YuvImage<'_>) -> Option<CpuFrame> {
     let (w, h) = (img.width as usize, img.height as usize);
     if w == 0 || h == 0 || !(8..=16).contains(&img.bit_depth) {
@@ -190,10 +190,10 @@ pub fn to_bgra(img: &YuvImage<'_>) -> Option<CpuFrame> {
     let c = Coefs::new(img.matrix, img.full_range);
     let mut out = vec![0u8; w * h * 4];
 
-    // Строки независимы: большой кадр (4K и т.п.) режем на полосы по потокам,
-    // иначе одна конвертация съедает весь бюджет кадра.
+    // Rows are independent: split a large frame (4K etc.) into bands across threads,
+    // otherwise the conversion alone eats the whole frame budget.
     let convert_band = |first_row: usize, band: &mut [u8]| {
-        // быстрый путь: 8 бит, 4:2:0, раздельные плоскости
+        // fast path: 8-bit, 4:2:0, separate planes
         if let (8, Chroma::Sub420, ChromaPlanes::Planar { u, v }) =
             (img.bit_depth, img.chroma, img.uv)
         {
@@ -313,7 +313,7 @@ mod tests {
 
     #[test]
     fn bt601_and_bt709_red() {
-        // чистый красный в limited range
+        // pure red in limited range
         assert!(close(
             solid420(81, 90, 240, 4, 4, Matrix::Bt601, false),
             [0, 0, 255, 255]
@@ -326,7 +326,7 @@ mod tests {
 
     #[test]
     fn odd_sizes_and_nv12() {
-        // 3x3, NV12 с шагом больше ширины
+        // 3x3, NV12 with stride larger than width
         let yp = vec![235u8; 4 * 3];
         let uvp = vec![128u8; 4 * 2];
         let img = YuvImage {
@@ -393,7 +393,7 @@ mod tests {
 
     #[test]
     fn parallel_matches_single_thread() {
-        // 1600x900 > порога: полосы по потокам должны дать тот же результат, что построчно
+        // 1600x900 > threshold: threaded bands must match the row-by-row result
         let (w, h) = (1600usize, 900usize);
         let yp: Vec<u8> = (0..w * h).map(|i| (i * 7 % 251) as u8).collect();
         let (cw, ch) = (w / 2, h / 2);

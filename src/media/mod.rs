@@ -1,5 +1,5 @@
-//! Источники медиа: картинка, GIF, видео. Все выглядят одинаково для реестра —
-//! «дай кадр на такую позицию, если он поменялся».
+//! Media sources: image, GIF, video. The registry sees them all the same way:
+//! "give me the frame for this position if it changed".
 
 pub mod gif;
 pub mod still;
@@ -20,27 +20,27 @@ pub enum Kind {
 
 #[derive(Debug, thiserror::Error)]
 pub enum MediaError {
-    #[error("нет файла {0}")]
+    #[error("file not found: {0}")]
     Missing(String),
-    #[error("не знаю формат {0}")]
+    #[error("unsupported format {0}")]
     UnknownFormat(String),
-    #[error("не открылся {path}: {reason}")]
+    #[error("failed to open {path}: {reason}")]
     Open { path: String, reason: String },
-    #[error("видео {path}: {reason}")]
+    #[error("video {path}: {reason}")]
     Video { path: String, reason: String },
 }
 
-/// Общий интерфейс источника.
+/// Common source interface.
 pub trait Source: Send {
     fn kind(&self) -> Kind;
 
-    /// Кадр, актуальный на `now`. `None` — картинка не поменялась с прошлого раза
-    /// (прослойка просто рисует прежнюю текстуру). Для видео `now` ещё и сигнал
-    /// «на меня смотрят»: без вызовов декодер засыпает.
+    /// The frame current at `now`. `None` means the image hasn't changed since
+    /// the last call (the shim keeps drawing the old texture). For video, `now`
+    /// also signals "someone is watching": without calls the decoder goes to sleep.
     fn poll(&mut self, now: Instant) -> Result<Option<Frame>, MediaError>;
 }
 
-/// Расширения, которые понимаем. Регистр не важен.
+/// Supported extensions, case-insensitive.
 pub fn kind_for(path: &Path) -> Option<Kind> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     match ext.as_str() {
@@ -51,7 +51,7 @@ pub fn kind_for(path: &Path) -> Option<Kind> {
     }
 }
 
-/// Открыть источник по пути. Ошибка уже готова к показу пользователю.
+/// Open a source by path. The error is ready to show to the user as is.
 pub fn open(play: &PlayParams, settings: &Settings) -> Result<Box<dyn Source>, MediaError> {
     let path = &play.path;
     let shown = path.display().to_string();
@@ -77,7 +77,7 @@ pub fn open(play: &PlayParams, settings: &Settings) -> Result<Box<dyn Source>, M
     })
 }
 
-/// Мелочь для источников: миллисекунды в Duration без переполнений.
+/// Small helper for sources: milliseconds to Duration without overflow.
 pub(crate) fn ms(v: u64) -> Duration {
     Duration::from_millis(v)
 }

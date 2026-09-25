@@ -1,5 +1,5 @@
-//! Контейнер → пакеты → декодер → кадры. Конкретные демуксеры и декодеры
-//! подключаются через трейты, петля и перемотка живут здесь один раз.
+//! Container → packets → decoder → frames. Concrete demuxers and decoders
+//! plug in via traits; looping and seeking live here, once.
 
 use std::time::Duration;
 
@@ -40,36 +40,36 @@ pub type PipeResult<T> = Result<T, String>;
 
 pub trait Demuxer: Send {
     fn info(&self) -> &VideoInfo;
-    /// `None` — конец файла.
+    /// `None` means end of file.
     fn next_packet(&mut self) -> PipeResult<Option<Packet>>;
-    /// К началу ролика (для петли).
+    /// Rewind to the start (for looping).
     fn rewind(&mut self) -> PipeResult<()>;
 }
 
 pub trait Decoder: Send {
     fn name(&self) -> &'static str;
-    /// Скормить пакет, забрать готовые кадры (их может быть 0 или несколько).
+    /// Feed a packet and collect ready frames (zero or more).
     fn decode(&mut self, packet: &Packet) -> PipeResult<Vec<DecodedFrame>>;
-    /// Конец потока: отдать всё, что застряло внутри.
+    /// End of stream: return everything still buffered.
     fn flush(&mut self) -> PipeResult<Vec<DecodedFrame>>;
-    /// Сбросить состояние после перемотки.
+    /// Reset state after a seek.
     fn reset(&mut self);
 }
 
-/// Демуксер + декодер + очередь готовых кадров.
+/// Demuxer + decoder + queue of ready frames.
 pub struct Pipeline {
     demux: Box<dyn Demuxer>,
     decoder: Box<dyn Decoder>,
     ready: std::collections::VecDeque<DecodedFrame>,
     flushed: bool,
     looped: bool,
-    /// Смещение pts после каждого круга петли, чтобы время шло монотонно.
+    /// pts offset added after each loop pass so time stays monotonic.
     loop_offset: Duration,
 }
 
 pub enum Next {
     Frame(DecodedFrame),
-    /// Ролик закончился и петли нет.
+    /// Video ended and looping is off.
     End,
 }
 
@@ -94,7 +94,7 @@ impl Pipeline {
     }
 
     pub fn next_frame(&mut self) -> PipeResult<Next> {
-        // ограничитель: битый файл не должен крутить поток вечно
+        // guard: a broken file must not spin the thread forever
         for _ in 0..4096 {
             if let Some(mut f) = self.ready.pop_front() {
                 f.pts += self.loop_offset;
@@ -118,14 +118,14 @@ impl Pipeline {
                 }
             }
         }
-        Err("декодер не выдаёт кадров".into())
+        Err("decoder produces no frames".into())
     }
 }
 
 #[cfg(test)]
 pub(crate) mod testing {
-    //! Синтетические демуксер и декодер: N кадров с шагом `step`, кадр = 1x1 BGRA
-    //! со значением номера кадра. Хватает, чтобы проверить петлю, часы и поток.
+    //! Synthetic demuxer and decoder: N frames spaced by `step`, each a 1x1 BGRA
+    //! holding the frame number. Enough to test looping, the clock and the thread.
     use super::*;
     use crate::frame::CpuFrame;
 
@@ -175,7 +175,7 @@ pub(crate) mod testing {
         }
     }
 
-    /// Держит один кадр внутри (как настоящие декодеры с задержкой) — проверяет flush.
+    /// Holds one frame back (like real decoders with latency) to exercise flush.
     #[derive(Default)]
     pub struct FakeDecoder {
         held: Option<Packet>,

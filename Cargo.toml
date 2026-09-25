@@ -8,27 +8,27 @@ license = "BSD-3-Clause"
 publish = false
 
 [workspace]
-# vaapi-helper — отдельная .so (VA-API через cros-codecs), вшивается в плагин
+# vaapi-helper: a separate .so (VA-API via cros-codecs), embedded into the plugin
 members = [".", "vaapi-helper"]
 default-members = ["."]
 
 [lib]
-# staticlib линкуется в libnoshare-cover.so вместе с тонкой C++-прослойкой (shim/plugin.cpp),
-# rlib нужен для cargo test.
+# staticlib is linked into libnoshare-cover.so together with the thin C++ shim (shim/plugin.cpp),
+# rlib is for cargo test.
 crate-type = ["staticlib", "rlib"]
 
 [features]
 default = ["nvdec", "vaapi", "cpu-av1", "cpu-h264", "cpu-vpx"]
-# NVIDIA: NVDEC через libcuda/libnvcuvid из драйвера (dlopen)
+# NVIDIA: NVDEC via libcuda/libnvcuvid from the driver (dlopen)
 nvdec = ["dep:libloading"]
-# Intel/AMD (и NVIDIA через nvidia-vaapi-driver): VA-API. Сам декодер — в
-# vaapi-helper (вшивается Makefile-ом, грузится из memfd)
+# Intel/AMD (and NVIDIA via nvidia-vaapi-driver): VA-API. The decoder itself lives in
+# vaapi-helper (embedded by the Makefile, loaded from a memfd)
 vaapi = ["dep:libloading", "dep:libc"]
-# программные фолбэки
+# software fallbacks
 cpu-av1 = ["dep:rav1d", "dep:libc"]
-# H.264 на CPU: системный libopenh264, грузится dlopen-ом при первом ролике
+# H.264 on CPU: system libopenh264, dlopen-ed on the first video
 cpu-h264 = ["dep:openh264", "dep:openh264-sys2"]
-# VP8/VP9 на CPU: системный libvpx через dlopen
+# VP8/VP9 on CPU: system libvpx via dlopen
 cpu-vpx = ["dep:libloading"]
 
 [dependencies]
@@ -38,7 +38,7 @@ libloading = { version = "0.8", optional = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 matroska-demuxer = "0.8.1"
 re_mp4 = "0.4.0"
-# AV1 на CPU: dav1d на Rust, asm-ядра через nasm (x86_64) / gas (aarch64)
+# AV1 on CPU: dav1d in Rust, asm kernels via nasm (x86_64) / gas (aarch64)
 rav1d = { version = "1.1", optional = true, default-features = false, features = ["asm", "bitdepth_8", "bitdepth_16"] }
 thiserror = "2"
 openh264 = { version = "0.9.8", default-features = false, features = ["libloading"], optional = true }
@@ -48,17 +48,17 @@ openh264-sys2 = { version = "0.9.8", default-features = false, features = ["libl
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-# Паника внутри композитора = упавший Hyprland. Все входы из C ловят панику сами
-# (ffi::guard), поэтому unwind оставляем, abort не ставим.
+# A panic inside the compositor means a crashed Hyprland. Every C entry point catches
+# panics itself (ffi::guard), so keep unwind, not abort.
 panic = "unwind"
 debug = "line-tables-only"
 
 [profile.dev]
 panic = "unwind"
 
-# cros-codecs 0.0.6 жёстко требует cros-libva 0.0.12, а тот не собирается с
-# libva 2.23+ (новые поля в VP9-энкодере). Своя копия с одной правкой: vendor/cros-libva.
+# cros-codecs 0.0.6 pins cros-libva 0.0.12, which doesn't build against
+# libva 2.23+ (new fields in the VP9 encoder). Local copy with a single fix: vendor/cros-libva.
 [patch.crates-io]
 cros-libva = { path = "vendor/cros-libva" }
-# re_mp4 0.4.0 падает на MP4 с обложкой PNG в метаданных (тип data 14)
+# re_mp4 0.4.0 crashes on MP4 files with PNG cover art in metadata (data type 14)
 re_mp4 = { path = "vendor/re_mp4" }

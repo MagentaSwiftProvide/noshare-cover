@@ -1,7 +1,7 @@
-//! Выбор GPU для аппаратного декода.
+//! GPU selection for hardware decoding.
 //!
-//! `gpu_device` из конфига — явный render node (`/dev/dri/renderD129`). Пусто —
-//! берём первый render node по номеру. Никаких переменных окружения.
+//! `gpu_device` in the config is an explicit render node (`/dev/dri/renderD129`).
+//! If empty, the lowest-numbered render node is used. No environment variables.
 
 use std::path::{Path, PathBuf};
 
@@ -10,7 +10,7 @@ pub fn pick_render_node(explicit: Option<&Path>) -> Result<PathBuf, String> {
         return if p.exists() {
             Ok(p.to_path_buf())
         } else {
-            Err(format!("нет устройства {}", p.display()))
+            Err(format!("no such device: {}", p.display()))
         };
     }
     first_render_node(Path::new("/dev/dri"))
@@ -18,7 +18,7 @@ pub fn pick_render_node(explicit: Option<&Path>) -> Result<PathBuf, String> {
 
 fn first_render_node(dir: &Path) -> Result<PathBuf, String> {
     let entries =
-        std::fs::read_dir(dir).map_err(|_| format!("нет {} (GPU недоступен)", dir.display()))?;
+        std::fs::read_dir(dir).map_err(|_| format!("no {} (GPU unavailable)", dir.display()))?;
     let mut nodes: Vec<(u32, PathBuf)> = entries
         .filter_map(Result::ok)
         .filter_map(|e| {
@@ -32,7 +32,7 @@ fn first_render_node(dir: &Path) -> Result<PathBuf, String> {
         .into_iter()
         .next()
         .map(|(_, p)| p)
-        .ok_or_else(|| "не найден ни один render node".into())
+        .ok_or_else(|| "no render node found".into())
 }
 
 #[cfg(test)]

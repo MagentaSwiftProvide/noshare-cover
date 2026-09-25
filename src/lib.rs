@@ -1,12 +1,12 @@
-//! noshare-cover: ядро плагина Hyprland на Rust.
+//! noshare-cover: Rust core of a Hyprland plugin.
 //!
-//! Hyprland не даёт плагинам C-API, только свой C++ ABI, который собирается под
-//! конкретную версию композитора. Поэтому тут вся логика (медиа, декод, часы
-//! воспроизведения, конфиг, жизненный цикл ресурсов, extra rects), а тонкая
-//! прослойка `shim/plugin.cpp` только регистрирует хук, читает конфиг и правила
-//! окон, превращает готовые кадры в текстуры Hyprland и рисует их.
+//! Hyprland offers plugins no C API, only its own C++ ABI, which is built for a
+//! specific compositor version. So all the logic lives here (media, decoding,
+//! playback clock, config, resource lifecycle, extra rects), and the thin shim
+//! `shim/plugin.cpp` only registers the hook, reads the config and window
+//! rules, turns decoded frames into Hyprland textures and draws them.
 //!
-//! Граница между ними — C ABI из [`ffi`], описанный в `include/noshare_cover.h`.
+//! The boundary between them is the C ABI from [`ffi`], declared in `include/noshare_cover.h`.
 
 pub mod clock;
 pub mod config;
