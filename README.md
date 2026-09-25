@@ -188,35 +188,36 @@ hl.plugin.load("/usr/lib/hyprland/plugins/libnoshare-cover.so")
 
 ### Nix
 
-The plugin must be built against the Hyprland you run. `packages.default` is built against the
-flake's `hyprland` input, so make it follow yours:
+The plugin must be built against the exact Hyprland you run, otherwise it refuses to load with
+`built for Hyprland <commit>, running <commit>`. The easiest way is the Home Manager module: it
+builds against the system `programs.hyprland.package` when the NixOS module is enabled (that is
+the Hyprland started through `/run/wrappers`), otherwise against
+`wayland.windowManager.hyprland.package`:
 
 ```nix
 inputs.noshare-cover = {
   url = "github:gitscout-bot/noshare-cover";
   inputs.nixpkgs.follows = "nixpkgs";
-  inputs.hyprland.follows = "hyprland";
 };
 ```
 
 ```nix
-wayland.windowManager.hyprland.plugins = [
-  inputs.noshare-cover.packages.${pkgs.stdenv.hostPlatform.system}.default
-];
-# or load it yourself: "${inputs.noshare-cover.packages.${system}.default}/lib/libnoshare-cover.so"
-```
-
-Hyprland from nixpkgs instead of the hyprwm flake: use `.nixpkgs`. Or let Home Manager pick the
-right one automatically (builds against `wayland.windowManager.hyprland.package`, or the
-system's `programs.hyprland.package`):
-
-```nix
 imports = [ inputs.noshare-cover.homeManagerModules.default ];
 programs.noshare-cover.enable = true;
+# adds it to wayland.windowManager.hyprland.plugins; to load it yourself use
+# "${config.programs.noshare-cover.package}/lib/libnoshare-cover.so"
 ```
 
-Any other Hyprland build: `inputs.noshare-cover.lib.mkNoshareCover pkgs yourHyprland`. There is
+Without Home Manager, on NixOS:
+`inputs.noshare-cover.lib.mkNoshareCover pkgs config.programs.hyprland.package`.
+
+The prebuilt packages only fit specific setups. `packages.default` is built against the flake's
+`hyprland` input, so it is right only if you run Hyprland from that same input (add
+`inputs.hyprland.follows = "hyprland"` and set `programs.hyprland.package` to it).
+`packages.nixpkgs` is built against `hyprland` from the nixpkgs this flake is locked to. There is
 also `overlays.default` (`pkgs.hyprlandPlugins.noshare-cover`, built against `final.hyprland`).
+
+To see which Hyprland is running: `hyprctl version`.
 
 ## Checking the GPU path
 

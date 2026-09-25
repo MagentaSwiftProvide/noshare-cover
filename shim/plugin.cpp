@@ -655,14 +655,18 @@ namespace {
 namespace {
     PLUGIN_DESCRIPTION_INFO initImpl(HANDLE handle) {
         g_handle = handle;
-        const PLUGIN_DESCRIPTION_INFO info{"noshare-cover", "image or video instead of the no_screen_share black box", "gitscout-bot", "2.0.1"};
+        const PLUGIN_DESCRIPTION_INFO info{"noshare-cover", "image or video instead of the no_screen_share black box", "gitscout-bot", "2.0.2"};
 
         // A plugin built against other headers reads wrong field offsets and
         // crashes the compositor. Bail out right away: Hyprland catches the exception,
         // unloads the plugin and shows the reason.
-        if (std::string{__hyprland_api_get_hash()} != __hyprland_api_get_client_hash()) {
-            notify("noshare-cover: built for a different Hyprland version, rebuild it (hyprpm update)", 10000);
-            throw std::runtime_error("noshare-cover: Hyprland version mismatch");
+        const std::string running{__hyprland_api_get_hash()};
+        const std::string built{__hyprland_api_get_client_hash()};
+        if (running != built) {
+            const std::string why = "noshare-cover: built for Hyprland " + built.substr(0, 7) + ", running " + running.substr(0, 7) +
+                ". Rebuild against the running Hyprland (hyprpm update; on Nix use programs.noshare-cover.enable)";
+            notify(why, 15000);
+            throw std::runtime_error(why);
         }
 
         if (!nsc_init())

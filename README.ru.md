@@ -189,35 +189,36 @@ hl.plugin.load("/usr/lib/hyprland/plugins/libnoshare-cover.so")
 
 ### Nix
 
-Плагин нужно собирать против того Hyprland, который запущен. `packages.default` собирается
-против входа `hyprland` этого флейка, поэтому направьте его на свой:
+Плагин нужно собирать ровно против того Hyprland, который запущен, иначе он не загрузится с
+ошибкой `built for Hyprland <коммит>, running <коммит>`. Проще всего через модуль Home Manager:
+он собирает против системного `programs.hyprland.package`, если включён модуль NixOS (это тот
+Hyprland, что запускается через `/run/wrappers`), иначе против
+`wayland.windowManager.hyprland.package`:
 
 ```nix
 inputs.noshare-cover = {
   url = "github:gitscout-bot/noshare-cover";
   inputs.nixpkgs.follows = "nixpkgs";
-  inputs.hyprland.follows = "hyprland";
 };
 ```
 
 ```nix
-wayland.windowManager.hyprland.plugins = [
-  inputs.noshare-cover.packages.${pkgs.stdenv.hostPlatform.system}.default
-];
-# или грузите сами: "${inputs.noshare-cover.packages.${system}.default}/lib/libnoshare-cover.so"
-```
-
-Hyprland из nixpkgs, а не из флейка hyprwm: берите `.nixpkgs`. Или пусть Home Manager подберёт
-нужный сам (соберёт против `wayland.windowManager.hyprland.package` или системного
-`programs.hyprland.package`):
-
-```nix
 imports = [ inputs.noshare-cover.homeManagerModules.default ];
 programs.noshare-cover.enable = true;
+# добавляет его в wayland.windowManager.hyprland.plugins; грузить самому:
+# "${config.programs.noshare-cover.package}/lib/libnoshare-cover.so"
 ```
 
-Любая другая сборка Hyprland: `inputs.noshare-cover.lib.mkNoshareCover pkgs вашHyprland`. Есть и
+Без Home Manager, на NixOS:
+`inputs.noshare-cover.lib.mkNoshareCover pkgs config.programs.hyprland.package`.
+
+Готовые пакеты подходят только под конкретные сетапы. `packages.default` собран против входа
+`hyprland` этого флейка, так что он подходит, только если Hyprland запущен из того же входа
+(добавьте `inputs.hyprland.follows = "hyprland"` и укажите его в `programs.hyprland.package`).
+`packages.nixpkgs` собран против `hyprland` из nixpkgs, на котором залочен этот флейк. Есть и
 `overlays.default` (`pkgs.hyprlandPlugins.noshare-cover`, собирается против `final.hyprland`).
+
+Какой Hyprland запущен: `hyprctl version`.
 
 ## Проверка GPU
 
