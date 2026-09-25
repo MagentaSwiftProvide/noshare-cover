@@ -29,7 +29,7 @@
         pkgs.hyprlandPlugins.mkHyprlandPlugin {
           hyprland = hyprlandPkg;
           pluginName = "noshare-cover";
-          version = "2.0.1";
+          version = "2.0.2";
           src = self;
 
           # Rust deps from Cargo.lock, no network needed in the sandbox
@@ -109,16 +109,17 @@
         let
           cfg = config.programs.noshare-cover;
           hmHyprland = config.wayland.windowManager.hyprland.package;
-          # wayland.windowManager.hyprland.package = null when Hyprland is installed by the
-          # NixOS module; then take the system one.
-          osHyprland = (args.osConfig or { }).programs.hyprland.package or null;
+          # When the NixOS module (programs.hyprland) is enabled, the session runs that
+          # Hyprland through /run/wrappers, so it wins over the Home Manager one.
+          osCfg = (args.osConfig or { }).programs.hyprland or { };
+          osHyprland = if osCfg.enable or false then osCfg.package or null else null;
           hyprlandPkg =
             if cfg.hyprlandPackage != null then
               cfg.hyprlandPackage
-            else if hmHyprland != null then
-              hmHyprland
             else if osHyprland != null then
               osHyprland
+            else if hmHyprland != null then
+              hmHyprland
             else
               pkgs.hyprland;
         in
@@ -128,7 +129,7 @@
             hyprlandPackage = lib.mkOption {
               type = lib.types.nullOr lib.types.package;
               default = null;
-              description = "Hyprland to build against. Default: wayland.windowManager.hyprland.package, then programs.hyprland.package of the system, then pkgs.hyprland.";
+              description = "Hyprland to build against. Default: the system programs.hyprland.package when that module is enabled, then wayland.windowManager.hyprland.package, then pkgs.hyprland.";
             };
             package = lib.mkOption {
               type = lib.types.package;
