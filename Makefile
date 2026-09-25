@@ -12,6 +12,7 @@ lib$(PLUGIN).so: main.cpp
 
 install: all
 	install -Dm755 lib$(PLUGIN).so $(prefix)/lib/lib$(PLUGIN).so
+	ln -sfn lib$(PLUGIN).so $(prefix)/lib/$(PLUGIN).so
 
 # локальная копия, Nix этот таргет не вызывает
 local: all
