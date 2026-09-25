@@ -1,66 +1,68 @@
 # noshare-cover
 
-[English](README.md)
+[English](README.md) · [Архитектура и статус](ARCHITECTURE.md)
 
-Плагин Hyprland. Окна с `no_screen_share` в захвате экрана закрываются картинкой или видео. На самом экране окно не меняется. Картинка растягивается на всё окно. Видео декодится на ГПУ отдельным процессом, Hyprland только заливает готовый кадр.
+Плагин Hyprland. Окна с `no_screen_share` в захвате экрана закрываются картинкой или видео
+вместо чёрного прямоугольника. На самом экране окно остаётся как есть.
 
-Плагин грузит hyprpm. `hl.plugin.load` рядом не нужен.
+Версия 0.2 — переписана: ядро на Rust (медиа, декод, часы воспроизведения, жизненный цикл,
+публичный API), тонкая C++-прослойка общается с C++ API плагинов Hyprland. Без FFmpeg,
+без cairo, без внешних процессов.
+
+> **Статус.** Работает целиком на живом Hyprland (0.56.2, Arch, llvmpipe): окно с
+> `no_screen_share` в захвате `grim` закрыто обложкой — картинка, GIF, H.264, AV1, VP9 —
+> и переживает многократные `hyprctl plugin unload/load` без роста потоков и памяти
+> (`tests/e2e/run.sh`). Собирается Nix-ом против Hyprland 0.56.0 и 0.56.2 из nixpkgs и
+> makepkg на Arch. GPU-декод (NVDEC, VA-API) написан, но на настоящих видеокартах ещё не
+> запускался — как проверить, в [README.md](README.md#checking-the-gpu-path).
+
+Декод: NVIDIA — NVDEC (из драйвера), Intel/AMD — VA-API (нужен `libva`), CPU — AV1 (rav1d,
+вшит), H.264 (`openh264`), VP8/VP9 (`libvpx`). Нет библиотеки — плагин один раз скажет, какой
+пакет поставить, и возьмёт то, что есть.
+
+## Конфиг
 
 ```lua
 hl.config({
     plugin = {
         no_screen_share_cover = {
-            -- png, jpg, jpeg, gif, mp4, m4v, mov, webm, mkv
-            path_cover = "~/.config/hypr/noshare-cover.gif",
+            path_cover = "~/.config/hypr/noshare-cover.gif", -- png, jpg, jpeg, gif, mp4, m4v, mov, webm, mkv
             loop = true,
             speed = 1.0,
+            backend = "auto",   -- "auto" (GPU, если можно, иначе CPU), "gpu" (только GPU), "cpu"
+            gpu_device = "",    -- render node для GPU, пусто = первый /dev/dri/renderD*
         },
     },
 })
 ```
 
-`path_cover` это запасной файл. На окне своя таблица. `~` раскрывается. Если подошло несколько правил, побеждает последнее значение.
-
-У правил окна Hyprland нет вложенных таблиц, поэтому один раз, до любых `hl.window_rule`:
+Своё медиа, скорость и петлю окну задаёт правило. Поля плагина плоские, обычные
+Lua-имена, `hl.window_rule` принимает их напрямую, без обёрток:
 
 ```lua
-do
-    local raw = hl.window_rule
-    function hl.window_rule(opts)
-        if type(opts) == "table" and type(opts.no_screen_share_cover) == "table" then
-            local cover = opts.no_screen_share_cover
-            opts.no_screen_share_cover = nil
-            if cover.path_cover ~= nil then opts["no_screen_share_cover:path_cover"] = cover.path_cover end
-            if cover.speed ~= nil then opts["no_screen_share_cover:speed"] = cover.speed end
-            if cover.loop ~= nil then opts["no_screen_share_cover:loop"] = cover.loop end
-        end
-        return raw(opts)
-    end
-end
-
 hl.window_rule({
     match = { class = [[^(com\.ayugram\.desktop)$]] },
     no_screen_share = true,
-    no_screen_share_cover = {
-        path_cover = "~/.config/hypr/NoCover/67.mp4",
-    },
+    no_screen_share_cover = "~/.config/hypr/NoCover/67.mp4", -- медиа для этого окна
+    no_screen_share_cover_speed = 1.5,                        -- необязательно
+    no_screen_share_cover_loop = false,                       -- необязательно
 })
 ```
 
-Без `no_screen_share` плагин окно не закрывает. Без `path_cover` берётся общий файл. То же для `speed` и `loop`.
+Старые имена из исходного плагина (`["no_screen_share_cover:path_cover"]` и т.д.) тоже
+работают. Последнее совпавшее правило побеждает. Ошибки показываются уведомлением один раз,
+пропавший файл подхватывается сам, как только появится.
 
-## Чужие прямоугольники
+## API для других плагинов
 
-Другой плагин может закрыть свои боксы в том же шаре. Библиотека `libnoshare-cover.so`. Hyprland грузит плагины с `RTLD_LOCAL`, поэтому путь бери через `dl_iterate_phdr`, потом `dlopen(path, RTLD_LAZY | RTLD_NOLOAD)` и `dlsym`:
+Заголовок [`include/noshare_cover_api.h`](include/noshare_cover_api.h), линковать ничего не
+надо: `noshare_cover_bind()` → свой клиент → `set_rects()` атомарно на монитор → заливка
+чёрным или обложкой окна по его адресу. Старые `noshare_cover_clear_extra_rects` /
+`noshare_cover_add_extra_rect` работают как раньше.
 
-```c
-void noshare_cover_clear_extra_rects(void);
-void noshare_cover_add_extra_rect(int monitor_id, double x, double y, double w, double h, double rounding);
-```
+## Установка
 
-`monitor_id` это id монитора Hyprland (`hyprctl monitors`, поле `id`). `x`, `y`, `w`, `h` и `rounding` в глобальных layout-пикселях, как позиция и размер окна. Плагин вычитает позицию монитора, умножает на scale и вычитает начало захвата. Прямоугольники живут до `noshare_cover_clear_extra_rects`. Рисуются чёрным после крышек окон. `rounding` `0` это острый прямоугольник.
-
-## Arch
+hyprpm (нужен `cargo` в `PATH`):
 
 ```sh
 hyprpm add https://github.com/gitscout-bot/noshare-cover
@@ -68,26 +70,13 @@ hyprpm enable noshare-cover
 hyprpm reload
 ```
 
-hyprpm сам собирает плагин под текущий Hyprland и сам его грузит.
+Arch — `packaging/arch/PKGBUILD`, Nix — `packages.default` (Hyprland из nixpkgs), `hyprland-git`, `overlays.default`, `lib.mkNoshareCover`; подробно в [README.md](README.md#nix).
 
-## Nix
+## Разработка
 
-Плагин должен собираться тем же Hyprland, что запущен. Во flake:
-
-```nix
-noshare-cover = {
-  url = "github:gitscout-bot/noshare-cover";
-  inputs.nixpkgs.follows = "nixpkgs";
-  inputs.hyprland.follows = "hyprland";
-};
+```sh
+cargo test
+cargo clippy --all-targets -- -D warnings
+make          # нужны заголовки Hyprland через pkg-config
+nix build
 ```
-
-Home Manager:
-
-```nix
-wayland.windowManager.hyprland.plugins = [
-  inputs.noshare-cover.packages.${pkgs.stdenv.hostPlatform.system}.default
-];
-```
-
-На NixOS-модуле то же самое в `programs.hyprland.plugins`. Модуль сам делает `plugin load`, второй раз через `hl.plugin.load` не надо.

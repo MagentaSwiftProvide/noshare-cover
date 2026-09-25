@@ -1,0 +1,118 @@
+/*
+ * noshare-cover: граница между Rust-ядром и C++-прослойкой Hyprland.
+ * Реализация — src/ffi.rs и src/extra.rs. Меняются вместе.
+ *
+ * Все функции вызываются из потока рендера Hyprland. Ни одна не бросает и не
+ * паникует наружу. Данные кадра (pixels, fd) живут до nsc_end_frame().
+ */
+#ifndef NOSHARE_COVER_H
+#define NOSHARE_COVER_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+/* типы публичного API; binder прослойке не нужен — она и есть этот плагин */
+#define NOSHARE_COVER_NO_BINDER
+#include "noshare_cover_api.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct {
+    const char* path_cover; /* "" — файл по умолчанию из ~/.config/hypr */
+    bool        loop;
+    double      speed;
+    const char* backend;    /* "auto" | "gpu" | "cpu" */
+    const char* gpu_device; /* "" — первый render node */
+} nsc_settings;
+
+/* Переопределения из правила окна; NULL — поле не задано. */
+typedef struct {
+    const char* rule_path;
+    const char* rule_speed;
+    const char* rule_loop;
+} nsc_play_request;
+
+enum {
+    NSC_FRAME_NONE   = 0,
+    NSC_FRAME_CPU    = 1, /* pixels: premultiplied BGRA, fourcc = DRM_FORMAT_ARGB8888 */
+    NSC_FRAME_DMABUF = 2, /* planes[]: fd НЕ закрывать, владелец — ядро; EGL владение не забирает */
+};
+
+typedef struct {
+    int32_t  fd;
+    uint32_t offset;
+    uint32_t stride;
+} nsc_plane;
+
+typedef struct {
+    uint64_t       cover_id;   /* стабильный ключ кэша текстур */
+    uint64_t       generation; /* сменился — текстуру обновить */
+    uint32_t       kind;
+    uint32_t       width;
+    uint32_t       height;
+    uint32_t       stride;
+    const uint8_t* pixels;
+    uint32_t       fourcc;
+    uint64_t       modifier;
+    uint32_t       plane_count;
+    nsc_plane      planes[4];
+} nsc_frame;
+
+/* Прямоугольник другого плагина (см. noshare_cover_api.h), уже без клиента. */
+typedef struct {
+    double   x, y, w, h, rounding;
+    uint64_t window; /* адрес окна для заливки его обложкой, 0 — нет */
+    uint32_t fill;   /* 0 — чёрный, 1 — обложка окна */
+} nsc_extra_rect;
+
+/*
+ * Раскладка структур закреплена числами с обеих сторон: здесь static_assert,
+ * в Rust — тест ffi::tests::abi_layout. Разъедутся — упадёт сборка или тест,
+ * а не Hyprland в рантайме. Числа для LP64 (x86_64 / aarch64 Linux).
+ */
+#if defined(__LP64__)
+#ifdef __cplusplus
+#define NSC_ASSERT static_assert
+#else
+#define NSC_ASSERT _Static_assert
+#endif
+NSC_ASSERT(sizeof(nsc_frame) == 112, "nsc_frame layout");
+NSC_ASSERT(offsetof(nsc_frame, pixels) == 32 && offsetof(nsc_frame, modifier) == 48 && offsetof(nsc_frame, planes) == 60, "nsc_frame offsets");
+NSC_ASSERT(sizeof(nsc_plane) == 12, "nsc_plane layout");
+NSC_ASSERT(sizeof(nsc_settings) == 40 && offsetof(nsc_settings, speed) == 16, "nsc_settings layout");
+NSC_ASSERT(sizeof(nsc_play_request) == 24, "nsc_play_request layout");
+NSC_ASSERT(sizeof(nsc_extra_rect) == 56 && offsetof(nsc_extra_rect, fill) == 48, "nsc_extra_rect layout");
+NSC_ASSERT(sizeof(noshare_cover_rect) == 56 && offsetof(noshare_cover_rect, window) == 40, "noshare_cover_rect layout");
+#undef NSC_ASSERT
+#endif
+
+bool     nsc_init(void);
+void     nsc_shutdown(void);
+void     nsc_set_settings(const nsc_settings* settings);
+uint64_t nsc_epoch(void);
+void     nsc_begin_frame(void);
+bool     nsc_resolve(const nsc_play_request* request, nsc_frame* out);
+void     nsc_end_frame(void);
+bool     nsc_cover_alive(uint64_t cover_id);
+size_t   nsc_take_notification(char* buf, size_t cap);
+size_t   nsc_extra_rects(int64_t monitor_id, nsc_extra_rect* out, size_t cap);
+
+/* Реализация публичного ABI (noshare_cover_api.h). Наружу его выставляют
+ * обёртки noshare_cover_* в shim/plugin.cpp: весь Rust-архив линкуется
+ * скрытым (--exclude-libs), чтобы не делить символы с другими плагинами. */
+uint32_t nsc_api_api_version(void);
+uint64_t nsc_api_register_client(const char* name);
+void     nsc_api_unregister_client(uint64_t client);
+bool     nsc_api_set_rects(uint64_t client, int monitor_id, const noshare_cover_rect* rects, size_t count);
+bool     nsc_api_clear_client_rects(uint64_t client);
+void     nsc_api_clear_extra_rects(void);
+void     nsc_api_add_extra_rect(int monitor_id, double x, double y, double w, double h, double rounding);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

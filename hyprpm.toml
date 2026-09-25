@@ -6,4 +6,5 @@ authors = ["vlad"]
 description = "Image or video instead of the no_screen_share black box"
 authors = ["vlad"]
 output = "libnoshare-cover.so"
+# нужен cargo (rustup или пакет rust) в PATH пользователя
 build = ["make -j$(nproc)"]

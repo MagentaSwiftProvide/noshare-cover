@@ -1,0 +1,1 @@
+vendor/cros-libva: cros-libva 0.0.12 (crates.io, BSD-3-Clause), одна правка в src/buffer/vp9.rs для libva 2.23+
