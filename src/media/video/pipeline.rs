@@ -118,7 +118,7 @@ impl Pipeline {
                 }
             }
         }
-        Err("decoder produces no frames".into())
+        Err(format!("{} produces no frames", self.decoder.name()))
     }
 }
 
