@@ -65,6 +65,16 @@ hl.window_rule({
 })
 ```
 
+Layer-shell surfaces (bars, launchers, wallpapers) work the same way through layer rules:
+
+```lua
+hl.layer_rule({
+    match = { namespace = "waybar" },
+    no_screen_share = true,
+    no_screen_share_cover = "~/.config/hypr/NoCover/bar.png",
+})
+```
+
 The field names of the original plugin (`["no_screen_share_cover:path_cover"]`,
 `[":speed"]`, `[":loop"]`) still work.
 
