@@ -131,6 +131,34 @@ nsc.set_rects(client, monitor_id, &r, 1);
 не загружен), noshare-cover не отказывается от загрузки, а ждёт, пока тот отпустит функцию.
 gloview отпускает её сам, как только видит noshare-cover, так что порядок загрузки неважен.
 
+## Зависимости
+
+**Для сборки**
+
+| Что | Зачем | Arch | Nix |
+|---|---|---|---|
+| `cargo` / `rustc` (1.89+) | ядро на Rust | `rust` | есть во флейке |
+| компилятор C++ (C++26), `make`, `pkg-config` | прослойка для Hyprland | `base-devel`, `pkgconf` | есть во флейке |
+| заголовки Hyprland | API плагинов | `hyprland` (hyprpm ставит свои) | из пакета Hyprland |
+| `nasm` | ассемблер для декодера AV1 (rav1d) | `nasm` | есть во флейке |
+| `clang` / libclang | привязки для помощника VA-API | `clang` | `bindgenHook` |
+| заголовки `libva`, `gbm` | помощник VA-API | `libva`, `mesa` | есть во флейке |
+
+`make NSC_VAAPI=0` собирает без VA-API; тогда clang, libva и gbm не нужны. `make` сначала
+всё проверяет и пишет, чего не хватает.
+
+**Для работы** (всё необязательно, плагин грузится и без этого)
+
+| Что | Для чего | Arch |
+|---|---|---|
+| драйвер NVIDIA (`libcuda`, `libnvcuvid`) | декод на видеокарте NVIDIA (NVDEC) | `nvidia-utils` |
+| `libva` + драйвер VA-API | декод на видеокарте Intel/AMD | `libva` + `mesa` / `intel-media-driver` |
+| `openh264` | H.264 на процессоре | `openh264` |
+| `libvpx` | VP8/VP9 на процессоре | `libvpx` |
+
+AV1 на процессоре, картинки и GIF ничего дополнительно не требуют. В Nix `openh264` и
+`libvpx` берутся из store, драйверы NVIDIA и VA-API — из системы (`/run/opengl-driver`).
+
 ## Установка
 
 ### hyprpm (Arch и другие)

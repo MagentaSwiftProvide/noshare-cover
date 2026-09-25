@@ -27,8 +27,11 @@ ifneq ($(call havepc,hyprland),y)
 MISSING += hyprland-headers(hyprpm update / pacman:hyprland)
 endif
 ifeq ($(NSC_VAAPI),1)
+# bindgen needs libclang, not the clang binary: Nix's bindgenHook only sets LIBCLANG_PATH
+ifeq ($(LIBCLANG_PATH),)
 ifneq ($(call have,clang),y)
 MISSING += clang(pacman:clang)
+endif
 endif
 ifneq ($(call havepc,libva libva-drm),y)
 MISSING += libva(pacman:libva)
