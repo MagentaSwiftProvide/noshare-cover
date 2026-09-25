@@ -22,6 +22,7 @@ fail() { printf '  \e[31mFAIL\e[0m %s\n' "$*"; FAILS=$((FAILS + 1)); }
 
 magick -size 640x360 gradient:'#ff00ff-#00ffff' "$WORK/cover.png"
 magick -size 320x180 xc:'#ff8800' "$WORK/rule.png"
+magick -size 320x180 xc:'#00c040' "$WORK/layer.png"
 # 0.35 с на кадр: интервал между снимками (1.2 с) не кратен циклу
 magick -delay 35 -size 64x64 xc:red xc:lime xc:blue -loop 0 "$WORK/anim.gif"
 
@@ -42,6 +43,8 @@ hl.config({
 })
 hl.window_rule({ match = { class = "cover-me" }, no_screen_share = true })
 hl.window_rule({ match = { class = "cover-rule" }, no_screen_share = true, no_screen_share_cover = "$2" })
+-- слой-обои от swaybg: обложка из layer rule
+hl.layer_rule({ match = { namespace = "wallpaper" }, no_screen_share = true, no_screen_share_cover = "$WORK/layer.png" })
 LUA
 }
 
@@ -101,6 +104,25 @@ check_video() { # файл, подпись
     elif awk "BEGIN{exit !($d > 0.005)}"; then pass "$2: видео идёт (RMSE между кадрами $d)"
     else fail "$2: кадр не меняется (RMSE $d)"; fi
 }
+
+echo "== layer rule"
+if command -v swaybg >/dev/null; then
+    swaybg -c '#202020' >/dev/null 2>&1 &
+    BGPID=$!
+    sleep 2
+    shot layer
+    # точка экрана без окон не найдётся при тайлинге на весь экран, поэтому смотрим
+    # на уголок под окнами не опираясь: плагин рисует слой первым, окна поверх — берём
+    # трейс и цвет в пикселе, где окна точно нет, если он есть; иначе — по трейсу
+    if grep -q "layer wallpaper: cover" "$WORK/trace.log"; then
+        pass "обложка на слое wallpaper из layer rule (по трейсу)"
+    else
+        fail "layer rule не сработал"; tail -5 "$WORK/trace.log"
+    fi
+    kill $BGPID 2>/dev/null
+else
+    echo "  (swaybg нет — пропуск)"
+fi
 
 echo "== видео и GIF"
 check_video "$MEDIA/h264.mp4" "H.264 (mp4)"

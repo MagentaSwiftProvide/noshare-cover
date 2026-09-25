@@ -187,6 +187,15 @@ impl Registry {
         });
     }
 
+    /// Есть ли недавно показанная анимированная обложка (видео, GIF). Прослойка
+    /// по этому решает, подталкивать ли Hyprland к новым кадрам захвата.
+    pub fn animating(&self, now: Instant) -> bool {
+        self.covers.values().any(|c| {
+            matches!(&c.state, State::Ready(src) if src.kind() != crate::media::Kind::Still)
+                && now.saturating_duration_since(c.last_used) < Duration::from_secs(1)
+        })
+    }
+
     /// Живые id обложек (прослойка чистит текстуры тех, кого тут нет).
     pub fn live_ids(&self) -> impl Iterator<Item = u64> + '_ {
         self.covers.values().map(|c| c.id)

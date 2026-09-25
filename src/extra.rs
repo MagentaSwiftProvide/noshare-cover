@@ -130,6 +130,7 @@ pub fn register(name: &str) -> u64 {
 
 pub fn unregister(id: u64) {
     clients().list.retain(|cl| cl.id != id);
+    gone_list().retain(|g| g.client != id);
 }
 
 /// Заменить все прямоугольники клиента на мониторе. Пустой список — очистить монитор.
@@ -176,6 +177,7 @@ pub fn for_monitor(monitor: i64) -> Vec<CoverRect> {
 
 /// Сброс при выгрузке плагина.
 pub fn reset() {
+    gone_list().clear();
     let mut c = clients();
     c.list.clear();
     c.next_id = LEGACY_CLIENT + 1;
@@ -313,6 +315,61 @@ pub extern "C" fn nsc_api_clear_client_rects(client: u64) -> bool {
     std::panic::catch_unwind(|| clear_client(client)).unwrap_or(false)
 }
 
+// ---------------------------------------------------------------- «ухожу»
+
+/// Колбэк клиента: noshare-cover выгружается. Зовётся из PLUGIN_EXIT уже после
+/// снятия хука renderMonitor и до остановки ядра: клиент должен забыть все
+/// указатели на наши функции и может сразу занять renderMonitor сам.
+pub type GoneCb = unsafe extern "C" fn(user: *mut std::ffi::c_void);
+
+struct Gone {
+    client: u64,
+    cb: GoneCb,
+    user: usize,
+}
+
+static GONE: Mutex<Vec<Gone>> = Mutex::new(Vec::new());
+
+fn gone_list() -> std::sync::MutexGuard<'static, Vec<Gone>> {
+    GONE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// # Safety
+/// `cb` — валидная функция, `user` живёт до её вызова или до снятия (cb = NULL).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nsc_api_set_gone_callback(
+    client: u64,
+    cb: Option<GoneCb>,
+    user: *mut std::ffi::c_void,
+) -> bool {
+    std::panic::catch_unwind(|| {
+        if client_mut(&mut clients(), client).is_none() {
+            return false;
+        }
+        let mut g = gone_list();
+        g.retain(|x| x.client != client);
+        if let Some(cb) = cb {
+            g.push(Gone {
+                client,
+                cb,
+                user: user as usize,
+            });
+        }
+        true
+    })
+    .unwrap_or(false)
+}
+
+/// Разослать «ухожу» всем клиентам. Список забираем целиком до вызовов:
+/// колбэк может звать наши же функции (unregister) — без дедлока.
+#[unsafe(no_mangle)]
+pub extern "C" fn nsc_api_notify_gone() {
+    let list = std::mem::take(&mut *gone_list());
+    for g in list {
+        let _ = std::panic::catch_unwind(|| unsafe { (g.cb)(g.user as *mut std::ffi::c_void) });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,5 +452,22 @@ mod tests {
         assert_eq!(nsc_api_api_version(), 2);
         reset();
         assert!(for_monitor(1).is_empty());
+    }
+
+    #[test]
+    fn gone_callbacks_fire_once_and_allow_reentry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static HITS: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn cb(user: *mut std::ffi::c_void) {
+            HITS.fetch_add(1, Ordering::SeqCst);
+            // колбэк зовёт наши функции — не должно быть дедлока
+            nsc_api_unregister_client(user as u64);
+        }
+        let id = register("gone-test");
+        assert!(unsafe { nsc_api_set_gone_callback(id, Some(cb), id as *mut _) });
+        assert!(!unsafe { nsc_api_set_gone_callback(999_999, Some(cb), std::ptr::null_mut()) });
+        nsc_api_notify_gone();
+        nsc_api_notify_gone();
+        assert_eq!(HITS.load(Ordering::SeqCst), 1);
     }
 }
