@@ -48,6 +48,8 @@ hl.config({
             backend = "auto",
             -- render node for GPU decode; empty = first /dev/dri/renderD*
             gpu_device = "",
+            -- ms to keep the cover after a closed window's animation ends
+            close_hold = 0,
         },
     },
 })
@@ -66,6 +68,7 @@ hl.window_rule({
     no_screen_share_cover = "~/.config/hypr/NoCover/67.mp4", -- media for this window
     no_screen_share_cover_speed = 1.5,                        -- optional
     no_screen_share_cover_loop = false,                       -- optional
+    no_screen_share_cover_hold = 300,                         -- optional, overrides close_hold
 })
 ```
 
@@ -83,6 +86,16 @@ The field names of the original plugin (`["no_screen_share_cover:path_cover"]`,
 `[":speed"]`, `[":loop"]`) still work.
 
 Without `no_screen_share` the window is not covered. If several rules match, the last value wins.
+
+When a window closes, Hyprland replaces it with a snapshot for the close animation, and
+`no_screen_share` does not apply to that snapshot, so without the plugin the window's content
+flashes in the stream. The cover follows the snapshot until the animation ends, then stays for
+`close_hold` ms (per window: `no_screen_share_cover_hold`). `0` covers just the animation.
+
+Cursor zoom (`cursor:zoom_factor`) is handled too: the stream gets the zoomed image, while
+Hyprland places its own `no_screen_share` boxes as if there were no zoom, so they miss the
+windows. While the monitor is zoomed the plugin draws all the boxes itself where the windows
+actually are: covers, or plain black for windows (and their popups) without a cover.
 
 Errors (missing file, unknown format, broken video, bad `backend`) are shown once as a
 Hyprland notification, not every frame. A missing file is picked up automatically as soon
