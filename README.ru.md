@@ -205,7 +205,16 @@ wayland.windowManager.hyprland.plugins = [
 ];
 ```
 
-С Hyprland из его собственного флейка берите `.hyprland-git` (и
+Проще всего через Home Manager: модуль сам собирает плагин против того Hyprland, который у
+вас запущен (`wayland.windowManager.hyprland.package` или системный
+`programs.hyprland.package`), так что ABI совпадает всегда:
+
+```nix
+imports = [ inputs.noshare-cover.homeManagerModules.default ];
+programs.noshare-cover.enable = true;
+```
+
+Иначе выбирайте пакет сами. С Hyprland из его собственного флейка берите `.hyprland-git` (и
 `inputs.hyprland.follows = "hyprland"`) или соберите против любого пакета Hyprland:
 `inputs.noshare-cover.lib.mkNoshareCover pkgs вашHyprland`. Есть и `overlays.default`
 (`pkgs.hyprlandPlugins.noshare-cover`).

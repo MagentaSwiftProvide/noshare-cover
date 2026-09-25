@@ -204,7 +204,16 @@ wayland.windowManager.hyprland.plugins = [
 ];
 ```
 
-With Hyprland from its own flake use `.hyprland-git` (and `inputs.hyprland.follows = "hyprland"`),
+Easiest with Home Manager: the module builds the plugin against whatever Hyprland you run
+(`wayland.windowManager.hyprland.package`, or the system's `programs.hyprland.package`), so
+the ABI always matches:
+
+```nix
+imports = [ inputs.noshare-cover.homeManagerModules.default ];
+programs.noshare-cover.enable = true;
+```
+
+Otherwise pick the package yourself. With Hyprland from its own flake use `.hyprland-git` (and `inputs.hyprland.follows = "hyprland"`),
 or build against any Hyprland package: `inputs.noshare-cover.lib.mkNoshareCover pkgs yourHyprland`.
 There is also `overlays.default` (`pkgs.hyprlandPlugins.noshare-cover`).
 
