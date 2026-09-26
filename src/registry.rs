@@ -117,6 +117,10 @@ impl Registry {
 
     /// Cover for a window. `None` means nothing to draw (no file, error, no frame yet).
     pub fn resolve(&mut self, play: &PlayParams, now: Instant) -> Option<CoverView<'_>> {
+        // no default cover and no rule for this window: nothing to draw, not an error
+        if play.path.as_os_str().is_empty() {
+            return None;
+        }
         let settings = self.settings();
         let frame_no = self.frame_no;
 
@@ -314,6 +318,15 @@ mod tests {
             g1 + 1
         );
         assert_eq!(r.len(), 2, "/default + /a");
+    }
+
+    #[test]
+    fn empty_path_is_silent() {
+        let mut r = reg();
+        let now = Instant::now();
+        r.begin_frame();
+        assert!(r.resolve(&play(""), now).is_none());
+        assert!(r.notifier().pop().is_none());
     }
 
     #[test]
