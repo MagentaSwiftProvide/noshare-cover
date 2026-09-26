@@ -197,6 +197,8 @@ pub fn expand_home(path: &str) -> PathBuf {
 }
 
 /// Default file: the first existing one from the list in `~/.config/hypr`, as before.
+/// Empty when none of them exists: without `path_cover` the default cover is optional,
+/// windows without a cover of their own just get the black box.
 pub fn default_media_path() -> PathBuf {
     default_media_path_in(&config_dir())
 }
@@ -217,7 +219,7 @@ fn default_media_path_in(dir: &Path) -> PathBuf {
         .iter()
         .map(|name| dir.join(name))
         .find(|p| p.exists())
-        .unwrap_or_else(|| dir.join(NAMES[0]))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -283,7 +285,7 @@ mod tests {
     fn default_media_prefers_first_existing() {
         let dir = std::env::temp_dir().join(format!("nsc-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(default_media_path_in(&dir), dir.join("noshare-cover.gif"));
+        assert_eq!(default_media_path_in(&dir), PathBuf::new());
         std::fs::write(dir.join("noshare-cover.png"), b"x").unwrap();
         assert_eq!(default_media_path_in(&dir), dir.join("noshare-cover.png"));
         std::fs::remove_dir_all(&dir).unwrap();

@@ -56,7 +56,8 @@ hl.config({
 ```
 
 `path_cover` is the fallback. Without it the plugin uses the first existing file among
-`~/.config/hypr/noshare-cover.{gif,jpg,jpeg,png,mp4}`. `~` is expanded.
+`~/.config/hypr/noshare-cover.{gif,jpg,jpeg,png,mp4}`; if there is none, windows without a
+cover of their own just get the black box, no error. `~` is expanded.
 
 A window can override the media, speed and loop with a rule. Plugin rule fields are flat,
 plain Lua names, so `hl.window_rule` takes them directly, no wrappers:
@@ -86,6 +87,10 @@ The field names of the original plugin (`["no_screen_share_cover:path_cover"]`,
 `[":speed"]`, `[":loop"]`) still work.
 
 Without `no_screen_share` the window is not covered. If several rules match, the last value wins.
+
+A window placed on top of a hidden one stays visible in the stream: the cover (or the black box)
+is drawn only where the hidden window actually shows. Translucent windows on top are the
+exception, the hidden window would show through them, so the cover stays over them.
 
 When a window or layer closes, Hyprland replaces it with a snapshot for the close animation,
 and `no_screen_share` does not apply to that snapshot, so without the plugin its content

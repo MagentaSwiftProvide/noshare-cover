@@ -64,8 +64,12 @@ start_hyprland() {
     sleep 2
 }
 
-open_win() { # class
-    foot --app-id "$1" sh -c 'while :; do date; sleep 0.2; done' >/dev/null 2>&1 &
+open_win() { # class [static]
+    if [ "${2:-}" = static ]; then
+        foot --app-id "$1" sleep 1000 >/dev/null 2>&1 & # draws once, then nothing changes
+    else
+        foot --app-id "$1" sh -c 'while :; do date; sleep 0.2; done' >/dev/null 2>&1 &
+    fi
     for _ in $(seq 40); do sleep 0.25; [ -n "$(win_box "$1")" ] && break; done
     sleep 1
 }
@@ -79,18 +83,25 @@ stream_on() { wf-recorder -y -f "$WORK/stream.mkv" -c libx264 -p preset=ultrafas
 # or not, so give it a second before the next restart.
 stream_off() { [ -n "$STREAM" ] && kill "$STREAM" 2>/dev/null; wait "$STREAM" 2>/dev/null; STREAM=; sleep 1; }
 
-close_case() { # $1 label, $2 close_hold, $3 anim speed, $4 delay before the shot, $5 expect cover (1/0), $6 "quiet": no frames for a while before closing
+# $6: "quiet": one shot, then no capture at all for a while before closing;
+#     "static": the stream runs but nothing on screen changes for a while before closing
+close_case() { # $1 label, $2 close_hold, $3 anim speed (0 = no animation), $4 delay before the shot, $5 expect cover (1/0), $6 mode
     write_config "$2" "$3" 1
     start_hyprland
-    open_win cover-me
-    open_win plain
+    local kind=; [ "${6:-}" = static ] && kind=static
+    open_win cover-me $kind
+    open_win plain $kind
     local box; box=$(inner "$(win_box cover-me)" 40)
-    if [ "${6:-}" = quiet ]; then
-        shot before # one frame with the window, then a static screen: no frames
-        sleep 2
-    else
-        stream_on
-    fi
+    case "${6:-}" in
+        quiet) shot before; sleep 2 ;;
+        static)
+            stream_on
+            local f0; f0=$(grep -ac "frame: monitor" "$WORK/trace.log")
+            sleep 2
+            echo "     frames during the static 2 s: $(($(grep -ac "frame: monitor" "$WORK/trace.log") - f0))"
+            ;;
+        *) stream_on ;;
+    esac
     kill "$(win_pid cover-me)"
     sleep "$4"
     shot "close-$1"
@@ -108,6 +119,41 @@ close_case "during the close animation" 0 30 0.5 1
 close_case "close_hold keeps it" 1500 1 0.8 1
 close_case "close_hold ends" 1500 1 2.8 0
 close_case "closed after a static screen" 0 30 0.5 1 quiet
+close_case "hold without animation, static stream" 3000 0 1.2 1 static
+
+echo "== window over a hidden one"
+write_config 0 0 1
+start_hyprland
+open_win cover-me
+open_win plain
+# plain floats, 400x300, in the middle of cover-me (the left half)
+hctl dispatch 'hl.dsp.window.float({ action = "toggle" })' >/dev/null
+hctl dispatch 'hl.dsp.window.resize({ x = 400, y = 300 })' >/dev/null
+hctl dispatch 'hl.dsp.window.move({ x = 120, y = 250 })' >/dev/null
+sleep 1
+PB=$(win_box plain)
+echo "     plain floating at $PB"
+shot overlap
+C=$(mean_rgb overlap "$(inner "$PB" 60)")
+is_cover "$C" || is_black "$C" && fail "window on top is painted over ($C)" || pass "window on top stays visible ($C)"
+# a strip of cover-me left of the floating window
+IFS='x+' read -r pw ph px py <<<"$PB"
+if [ "$px" -gt 60 ]; then
+    C=$(mean_rgb overlap "40x$((ph / 2))+$((px - 50))+$((py + ph / 4))")
+    is_cover "$C" && pass "hidden window around it is still covered ($C)" || fail "hidden window not covered next to the floating one ($C)"
+fi
+# a translucent window on top: the hidden one would show through it, so the cover stays
+kill "$(win_pid plain)"; sleep 0.5
+foot --app-id glass -o colors-dark.alpha=0.6 sh -c 'while :; do date; sleep 0.2; done' >/dev/null 2>&1 &
+for _ in $(seq 40); do sleep 0.25; [ -n "$(win_box glass)" ] && break; done
+sleep 1
+hctl dispatch 'hl.dsp.window.float({ action = "toggle" })' >/dev/null
+hctl dispatch 'hl.dsp.window.resize({ x = 400, y = 300 })' >/dev/null
+hctl dispatch 'hl.dsp.window.move({ x = 120, y = 250 })' >/dev/null
+sleep 1
+shot glass
+C=$(mean_rgb glass "$(inner "$(win_box glass)" 60)")
+is_cover "$C" && pass "translucent window on top: nothing shows through ($C)" || fail "hidden window shows through a translucent one ($C)"
 
 echo "== cursor zoom"
 write_config 0 0 2

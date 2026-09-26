@@ -111,6 +111,23 @@ namespace {
             return v->m_popupHead; // 0.56
     }
 
+    // fully opaque: nothing below shows through it (alpha rules, transparent terminals...)
+    template <class W>
+    bool windowOpaque(const W& w) {
+        if constexpr (requires { w->presentation().opaque(); })
+            return w->presentation().opaque(); // main
+        else
+            return w->opaque(); // 0.56
+    }
+
+    template <class W>
+    bool windowFloating(const W& w) {
+        if constexpr (requires { w->m_isFloating; })
+            return w->m_isFloating; // 0.56
+        else
+            return w->isFloating(); // main
+    }
+
     template <class W>
     bool windowIsX11(const W& w) {
         if constexpr (requires { w->m_isX11; })
@@ -174,6 +191,9 @@ namespace {
     // push settings to the core right after every config reload, not on the first
     // screencast frame: the default cover gets warmed up before capture starts
     CHyprSignalListener g_onReload;
+    // window/layer close: start the closing cover right when Hyprland unmaps it
+    CHyprSignalListener g_onWindowClose;
+    CHyprSignalListener g_onLayerClose;
 
     // renderMonitor may be hooked by another plugin (gloview takes it while
     // noshare-cover isn't loaded). In that case don't fail the load, keep retrying
@@ -387,10 +407,6 @@ namespace {
         }
     }
 
-    bool monitorZoomed(const PHLMONITOR& mon) {
-        return mon && g_zoom.contains(mon->m_id);
-    }
-
     // Unzoomed monitor pixel box -> where it ends up in the screencast image.
     CBox zoomed(const PHLMONITOR& mon, const CBox& b) {
         const auto it = g_zoom.find(mon->m_id);
@@ -407,10 +423,11 @@ namespace {
         return it == g_zoom.end() || it->second.full.x <= 0 ? 1.0 : it->second.box.w / it->second.full.x;
     }
 
-    // Hyprland's own black boxes land in the wrong place under zoom and can't be erased
-    // once drawn. While the original renderMonitor runs, no_screen_share is switched off
-    // on the highest priority slot (restored exactly right after), and we draw every box
-    // ourselves: covers, or plain black where no cover is set.
+    // Hyprland's own black boxes land in the wrong place under zoom and are drawn over
+    // windows stacked above the hidden one, and can't be erased once drawn. While the
+    // original renderMonitor runs, no_screen_share is switched off on the highest
+    // priority slot (restored exactly right after), and we draw every box ourselves:
+    // covers, or plain black where no cover is set.
     struct SSuppressed {
         Desktop::Types::COverridableVar<bool>* var = nullptr;
         std::optional<bool>                    prev;
@@ -445,8 +462,10 @@ namespace {
         }
     }
 
-    void drawBlack(const CBox& box, int round = 0, float roundingPower = 2.F) {
-        g_pHyprRenderer->draw(CRectPassElement::SRectData{.box = box, .color = CHyprColor{0.F, 0.F, 0.F, 1.F}, .round = round, .roundingPower = roundingPower}, box);
+    // clip: where drawing is allowed (the draw is scissored to it); empty = the whole box
+    void drawBlack(const CBox& box, int round = 0, float roundingPower = 2.F, const CRegion& clip = {}) {
+        g_pHyprRenderer->draw(CRectPassElement::SRectData{.box = box, .color = CHyprColor{0.F, 0.F, 0.F, 1.F}, .round = round, .roundingPower = roundingPower},
+                              clip.empty() ? CRegion{box} : clip);
     }
 
     // Popups (menus, tooltips) of a hidden window or layer, black like Hyprland does.
@@ -656,6 +675,48 @@ namespace {
         }
     }
 
+    void startPump();
+
+    // Hyprland emits window.close / layer.closed from unmap, while the window or layer
+    // still has its geometry and rules and before its fade-out exists. Starting the
+    // closing cover here doesn't depend on the stream sending frames (a static screen
+    // sends none, and the frame-based tracking above then only has old data).
+    void startClosing(bool isLayer, uintptr_t key, const PHLMONITOR& mon, const CBox& box, SRuleValues&& rules, float rounding, float roundingPower) {
+        const auto& mgr = Screenshare::mgr();
+        if (!mon || !mgr || !mgr->isOutputBeingSSd(mon))
+            return;
+        g_lastCovers.erase(key); // don't start it a second time from the next frame
+        g_closing.push_back(SClosing{
+            .isLayer       = isLayer,
+            .mon           = mon,
+            .box           = box,
+            .rules         = std::move(rules),
+            .rounding      = rounding,
+            .roundingPower = roundingPower,
+            .bindUntil     = std::chrono::steady_clock::now() + FADE_BIND_WINDOW,
+        });
+        NSC_TRACE("%s close event: cover kept at %.0f,%.0f %.0fx%.0f\n", isLayer ? "layer" : "window", box.x, box.y, box.w, box.h);
+        startPump();
+    }
+
+    void onWindowClose(const PHLWINDOW& w) {
+        if (!w || !w->m_ruleApplicator || !w->m_ruleApplicator->noScreenShare().valueOrDefault())
+            return;
+        const auto* ws           = w->m_workspace.get();
+        const auto  renderOffset = ws && !windowPinned(w) && ws->m_renderOffset ? ws->m_renderOffset->value() : Vector2D{};
+        const auto  pos          = w->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT) + renderOffset;
+        const auto  size         = w->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
+        startClosing(false, reinterpret_cast<uintptr_t>(w.get()), w->m_monitor.lock(), CBox{pos, size}, ruleValuesFor(w), windowRounding(w), windowRoundingPower(w));
+    }
+
+    void onLayerClose(const PHLLS& l) {
+        if (!l || !l->m_ruleApplicator || !l->m_ruleApplicator->noScreenShare().valueOrDefault())
+            return;
+        const auto pos  = l->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
+        const auto size = l->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
+        startClosing(true, reinterpret_cast<uintptr_t>(l.get()), l->m_monitor.lock(), CBox{pos, size}, ruleValuesFor(l), 0.F, 2.F);
+    }
+
     void paintClosing(const PHLMONITOR& mon, const Vector2D& capturePos, std::chrono::steady_clock::time_point now) {
         for (auto& c : g_closing) {
             if (c.mon.lock() != mon)
@@ -780,6 +841,48 @@ namespace {
         g_pump.reset();
     }
 
+    // A window as it lands in the capture image.
+    struct SWinGeo {
+        Vector2D pos, size; // global logical, pos includes the workspace render offset
+        CBox     box;       // capture pixels
+        int      round         = 0;
+        float    roundingPower = 2.F;
+        bool     floating      = false;
+        bool     opaque        = false;
+    };
+
+    std::optional<SWinGeo> windowGeo(const PHLWINDOW& w, const PHLMONITOR& mon, const Vector2D& capturePos) {
+        if (!g_pHyprRenderer->shouldRenderWindow(w, mon) || w->isHidden())
+            return std::nullopt;
+        const auto  fade = windowFade(w);
+        const auto* ws   = w->m_workspace.get();
+        if (!ws && fade != 0.F)
+            return std::nullopt;
+
+        SWinGeo    g;
+        const auto renderOffset = ws && !windowPinned(w) && ws->m_renderOffset ? ws->m_renderOffset->value() : Vector2D{};
+        g.size                  = w->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
+        g.pos                   = w->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT) + renderOffset;
+        g.box = zoomed(mon, CBox{g.pos.x, g.pos.y, std::max(g.size.x, 5.0), std::max(g.size.y, 5.0)}.translate(-mon->m_position).scale(mon->m_scale)).translate(-capturePos);
+        if (g.box.w < 1 || g.box.h < 1)
+            return std::nullopt;
+        const bool fullscreen = Fullscreen::controller() && Fullscreen::controller()->isFullscreen(w, Fullscreen::FSMODE_FULLSCREEN);
+        const bool dontRound  = capturePos != Vector2D{} || fullscreen;
+        g.round               = dontRound ? 0 : int(std::lround(windowRounding(w) * mon->m_scale * zoomScale(mon)));
+        g.roundingPower       = dontRound ? 2.F : windowRoundingPower(w);
+        g.floating            = windowFloating(w);
+        g.opaque              = windowOpaque(w);
+        return g;
+    }
+
+    // Take an opaque box out of a region, but keep its r x r corners: a rounded window
+    // is transparent there, and whatever is below would show through.
+    void subtractRounded(CRegion& region, const CBox& b, int r) {
+        r = std::clamp(r, 0, int(std::min(b.w, b.h) / 2));
+        region.subtract(CBox{b.x + r, b.y, b.w - 2 * r, b.h});
+        region.subtract(CBox{b.x, b.y + r, b.w, b.h - 2 * r});
+    }
+
     // ownBoxes: Hyprland's black boxes were suppressed for this frame (see
     // suppressNoScreenShare), so everything without a cover is drawn black here.
     void paintCovers(Screenshare::CScreenshareFrame* frame, bool ownBoxes) {
@@ -802,34 +905,51 @@ namespace {
         const auto capturePos = frame->m_session->m_captureBox.pos();
         const auto now        = std::chrono::steady_clock::now();
 
-        std::unordered_set<uintptr_t> seen;
-        for (const auto& w : Desktop::windowState()->windows()) {
-            if (!w || !w->m_ruleApplicator || !w->m_ruleApplicator->noScreenShare().valueOrDefault())
-                continue;
-            if (!g_pHyprRenderer->shouldRenderWindow(w, mon) || w->isHidden()) {
-                NSC_TRACE("window %s: not rendered on this monitor\n", windowClass(w).c_str());
-                continue;
+        // Windows drawn on top of others: later in the stack (floating over tiled, then
+        // list order). A cover is only drawn where its window is actually visible, so an
+        // opaque window placed over a hidden one stays visible. Layers (bars) are left
+        // alone: they are often translucent and we can't tell.
+        struct SVisible {
+            PHLWINDOW w;
+            SWinGeo   geo;
+        };
+        std::vector<SVisible> visible;
+        for (const auto& w : Desktop::windowState()->windows())
+            if (w)
+                if (const auto g = windowGeo(w, mon, capturePos))
+                    visible.push_back({w, *g});
+        const auto visibleRegion = [&](size_t i) {
+            const auto& me = visible[i].geo;
+            CRegion     region{me.box};
+            for (size_t j = 0; j < visible.size(); ++j) {
+                const auto& o     = visible[j].geo;
+                const bool  above = (o.floating && !me.floating) || (o.floating == me.floating && j > i);
+                // Only opaque windows hide what is below them. Under a translucent one the
+                // hidden window would show through, so the cover stays there.
+                if (j != i && above && o.opaque)
+                    subtractRounded(region, o.box, o.round);
             }
+            return region;
+        };
 
-            const auto  fade = windowFade(w);
-            const auto* ws   = w->m_workspace.get();
-            if (!ws && fade != 0.F)
+        std::unordered_set<uintptr_t> seen;
+        for (size_t i = 0; i < visible.size(); ++i) {
+            const auto& w = visible[i].w;
+            if (!w->m_ruleApplicator || !w->m_ruleApplicator->noScreenShare().valueOrDefault())
                 continue;
 
-            const bool pinned       = windowPinned(w);
-            const auto renderOffset = ws && !pinned && ws->m_renderOffset ? ws->m_renderOffset->value() : Vector2D{};
-            const auto size         = w->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
-            const auto pos          = w->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT) + renderOffset;
-            const auto box =
-                zoomed(mon, CBox{pos.x, pos.y, std::max(size.x, 5.0), std::max(size.y, 5.0)}.translate(-mon->m_position).scale(mon->m_scale)).translate(-capturePos);
-            if (box.w < 1 || box.h < 1)
-                continue;
+            const auto& geo           = visible[i].geo;
+            const auto  pos           = geo.pos;
+            const auto  size          = geo.size;
+            const auto  box           = geo.box;
+            const int   round         = geo.round;
+            const auto  roundingPower = geo.roundingPower;
             g_animBoxes.push_back({mon, CBox{pos.x, pos.y, size.x, size.y}});
 
-            const bool fullscreen    = Fullscreen::controller() && Fullscreen::controller()->isFullscreen(w, Fullscreen::FSMODE_FULLSCREEN);
-            const bool dontRound     = capturePos != Vector2D{} || fullscreen;
-            const int  round         = dontRound ? 0 : int(std::lround(windowRounding(w) * mon->m_scale * zoomScale(mon)));
-            const auto roundingPower = dontRound ? 2.F : windowRoundingPower(w);
+            const CRegion clip = visibleRegion(i);
+            if (clip.empty()) {
+                NSC_TRACE("window %s: fully under other windows\n", windowClass(w).c_str());
+            }
             if (ownBoxes && !windowIsX11(w)) {
                 if (const auto geo = windowClientGeometryPos(w))
                     paintPopupBoxes(w, pos - *geo, mon, capturePos);
@@ -853,22 +973,24 @@ namespace {
                 .rule_speed = rules.speed ? rules.speed->c_str() : nullptr,
                 .rule_loop  = rules.loop ? rules.loop->c_str() : nullptr,
             };
+            if (clip.empty())
+                continue;
             nsc_frame f{};
             if (!nsc_resolve(&req, &f)) {
                 NSC_TRACE("window %s: no cover frame yet\n", windowClass(w).c_str());
                 if (ownBoxes)
-                    drawBlack(box, round, roundingPower);
+                    drawBlack(box, round, roundingPower, clip);
                 continue;
             }
             const auto tex = textureFor(f);
             if (!tex) {
                 NSC_TRACE("window %s: texture failed (%ux%u)\n", windowClass(w).c_str(), f.width, f.height);
                 if (ownBoxes)
-                    drawBlack(box, round, roundingPower);
+                    drawBlack(box, round, roundingPower, clip);
                 continue;
             }
             NSC_TRACE("window %s: cover %ux%u at %.0f,%.0f %.0fx%.0f\n", windowClass(w).c_str(), f.width, f.height, box.x, box.y, box.w, box.h);
-            g_pHyprRenderer->draw(CTexPassElement::SRenderData{.tex = tex, .box = box, .round = round, .roundingPower = roundingPower}, box);
+            g_pHyprRenderer->draw(CTexPassElement::SRenderData{.tex = tex, .box = box, .round = round, .roundingPower = roundingPower}, clip);
         }
 
 
@@ -927,12 +1049,9 @@ namespace {
     void hkRenderMonitor(Screenshare::CScreenshareFrame* self) {
         NSC_TRACE("hook: renderMonitor\n");
         const auto original = reinterpret_cast<RenderMonitorFn>(g_hook->m_original);
-        const bool zoom     = g_pHyprRenderer && monitorZoomed(g_pHyprRenderer->m_renderData.pMonitor.lock());
-        if (!zoom) {
-            original(self);
-            paintCovers(self, false);
-            return;
-        }
+        // Hyprland's boxes are always switched off and drawn by us: under zoom they land
+        // in the wrong place, and they are drawn over everything, including windows that
+        // sit on top of a hidden one.
         const auto suppressed = suppressNoScreenShare();
         try {
             original(self);
@@ -1018,6 +1137,8 @@ namespace {
     // pointing into an unloaded .so and crash the compositor on the next config reload.
     void cleanupAll() {
         g_onReload.reset();
+        g_onWindowClose.reset();
+        g_onLayerClose.reset();
         stopHookRetry();
         stopPump();
         // Remove the hook first: Hyprland cleans up hooks only after PLUGIN_EXIT, and a
@@ -1065,7 +1186,7 @@ namespace {
 namespace {
     PLUGIN_DESCRIPTION_INFO initImpl(HANDLE handle) {
         g_handle = handle;
-        const PLUGIN_DESCRIPTION_INFO info{"noshare-cover", "image or video instead of the no_screen_share black box", "gitscout-bot", "2.0.5"};
+        const PLUGIN_DESCRIPTION_INFO info{"noshare-cover", "image or video instead of the no_screen_share black box", "gitscout-bot", "2.0.6"};
 
         // A plugin built against other headers reads wrong field offsets and
         // crashes the compositor. Bail out right away: Hyprland catches the exception,
@@ -1104,6 +1225,9 @@ namespace {
         }
         if (!target)
             throw std::runtime_error("noshare-cover: CScreenshareFrame::renderMonitor not found");
+
+        g_onWindowClose = Event::bus()->m_events.window.close.listen([](PHLWINDOW w) { onWindowClose(w); });
+        g_onLayerClose  = Event::bus()->m_events.layer.closed.listen([](PHLLS l) { onLayerClose(l); });
 
         g_onReload = Event::bus()->m_events.config.reloaded.listen([] {
             pushSettings();
