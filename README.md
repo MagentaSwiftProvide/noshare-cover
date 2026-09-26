@@ -50,6 +50,10 @@ hl.config({
             gpu_device = "",
             -- ms to keep the cover after a closed window's animation ends
             close_hold = 0,
+            -- capture clients (exe names) that see hidden windows as they are
+            show_to = "",
+            -- if set, hide only from these clients; everyone else sees everything
+            hide_from = "",
         },
     },
 })
@@ -99,6 +103,16 @@ and `no_screen_share` does not apply to that snapshot, so without the plugin its
 flashes in the stream. The cover follows the snapshot until the animation ends, then stays for
 `close_hold` ms (per window or layer rule: `no_screen_share_cover_hold`). `0` covers just the
 animation.
+
+By default hidden windows are covered in every capture: portal streams (browsers, Discord,
+OBS via PipeWire) and clients that capture the screen directly (grim, wf-recorder,
+gpu-screen-recorder, OBS with wlrobs). The capture client is told apart by its executable
+(`/proc/<pid>/exe` of the Wayland client). `show_to = "grim, hyprshot"` lets those clients see
+hidden windows as they are, for example for your own screenshots. `hide_from =
+"xdg-desktop-portal-hyprland"` does the opposite: windows are hidden only from the listed
+clients (here, only from portal streams) and a client that can't be identified is still
+covered. Names are separated by commas or spaces. With both lists empty the plugin never
+looks the client up.
 
 Cursor zoom (`cursor:zoom_factor`) is handled too: the stream gets the zoomed image, while
 Hyprland places its own `no_screen_share` boxes as if there were no zoom, so they miss the
