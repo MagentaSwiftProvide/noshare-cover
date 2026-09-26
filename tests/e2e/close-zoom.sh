@@ -146,24 +146,33 @@ fi
 # window's own background), never the hidden window, and the window itself stays drawn.
 # The hidden foot is dark gray: showing through, it would give ~36 36 36.
 shows_cover_through() { read -r r g b <<<"$1"; [ "$r" -gt 70 ] && [ "$b" -gt 70 ] && [ "$g" -lt 70 ] && [ "$r" -lt 230 ]; }
-glass_case() { # $1 label, $2 blur true/false
+glass_case() { # $1 label, $2 blur true/false, $3 class of the translucent window (cover-me: hidden itself)
+    local cls=${3:-glass}
     write_config 0 0 1 "$2"
     start_hyprland
     open_win cover-me
-    foot --app-id glass -o colors-dark.alpha=0.6 sh -c 'while :; do date; sleep 0.2; done' >/dev/null 2>&1 &
-    for _ in $(seq 40); do sleep 0.25; [ -n "$(win_box glass)" ] && break; done
+    foot --app-id "$cls" -o colors-dark.alpha=0.6 sh -c 'while :; do date; sleep 0.2; done' >/dev/null 2>&1 &
+    for _ in $(seq 40); do sleep 0.25; [ "$(hctl clients -j | jq --arg c "$cls" '[.[] | select(.class == $c)] | length')" -ge "$([ "$cls" = cover-me ] && echo 2 || echo 1)" ] && break; done
     sleep 1
     hctl dispatch 'hl.dsp.window.float({ action = "toggle" })' >/dev/null
     hctl dispatch 'hl.dsp.window.resize({ x = 400, y = 300 })' >/dev/null
     hctl dispatch 'hl.dsp.window.move({ x = 120, y = 250 })' >/dev/null
     sleep 1
-    shot "glass-$2"
-    local c; c=$(mean_rgb "glass-$2" "$(inner "$(win_box glass)" 60)")
-    shows_cover_through "$c" && pass "$1: the cover shows through it ($c)" || fail "$1: expected the cover through the window, got $c"
+    shot "glass-$2-$cls"
+    # the active (last opened, floating) window of that class
+    local box; box=$(hctl activewindow -j | jq -r '"\(.size[0])x\(.size[1])+\(.at[0])+\(.at[1])"')
+    local c; c=$(mean_rgb "glass-$2-$cls" "$(inner "$box" 60)")
+    if [ "$cls" = cover-me ]; then
+        # hidden itself: its own content must never be drawn, only the cover
+        is_cover "$c" && pass "$1: covered, its content is not drawn ($c)" || fail "$1: its content leaks ($c)"
+    else
+        shows_cover_through "$c" && pass "$1: the cover shows through it ($c)" || fail "$1: expected the cover through the window, got $c"
+    fi
 }
 kill "$(win_pid plain)"
 glass_case "translucent window on top" false
 glass_case "translucent window with blur on top" true
+glass_case "hidden translucent window over a hidden one" true cover-me
 
 echo "== cursor zoom"
 write_config 0 0 2
