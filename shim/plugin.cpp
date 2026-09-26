@@ -17,7 +17,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cerrno>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <expected>
 #include <format>
@@ -34,8 +36,13 @@
 #include <stdexcept>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unistd.h>
+
+#ifndef NSC_VERSION // set by the Makefile from Cargo.toml
+#define NSC_VERSION "unknown"
+#endif
 #include <unordered_map>
 #include <unordered_set>
 #include <variant>
@@ -1212,8 +1219,20 @@ namespace {
             return {};
         char       buf[4096];
         const auto n = readlink(std::format("/proc/{}/exe", pid).c_str(), buf, sizeof(buf) - 1);
-        if (n <= 0)
-            return {};
+        if (n <= 0) {
+            // exe needs ptrace read access, which some setups deny; comm is always
+            // readable (first 15 chars of the executable name)
+            NSC_TRACE("capture client pid %d: /proc/pid/exe: %s, falling back to comm\n", (int)pid, std::strerror(errno));
+            std::string comm;
+            if (FILE* f = std::fopen(std::format("/proc/{}/comm", pid).c_str(), "r")) {
+                if (std::fgets(buf, sizeof(buf), f))
+                    comm = buf;
+                std::fclose(f);
+            }
+            while (!comm.empty() && (comm.back() == '\n' || comm.back() == '\r'))
+                comm.pop_back();
+            return comm;
+        }
         std::string exe(buf, n);
         if (exe.ends_with(" (deleted)")) // the binary was updated while running
             exe.resize(exe.size() - 10);
@@ -1231,8 +1250,12 @@ namespace {
             const auto start = list.find_first_not_of(", \t", i);
             if (start == std::string::npos)
                 break;
-            const auto end = list.find_first_of(", \t", start);
-            if (list.compare(start, end == std::string::npos ? std::string::npos : end - start, exe) == 0)
+            const auto end   = list.find_first_of(", \t", start);
+            const auto entry = std::string_view(list).substr(start, end == std::string::npos ? std::string::npos : end - start);
+            if (entry == exe)
+                return true;
+            // a name from /proc/pid/comm is cut to 15 chars (xdg-desktop-portal-hyprland -> xdg-desktop-por)
+            if (exe.size() == 15 && entry.size() > 15 && entry.starts_with(exe))
                 return true;
             i = end;
         }
@@ -1250,6 +1273,7 @@ namespace {
         if (!byHideList && !hasEntries(g_cfgShowTo))
             return true; // no lists: the old behaviour, no /proc lookups per frame
         const auto exe = captureClientExe(frame);
+        NSC_TRACE("capture client: %s\n", exe.empty() ? "(unknown)" : exe.c_str());
         if (byHideList)
             return exe.empty() || listHas(g_cfgHideFrom, exe); // unknown client: hide, to be safe
         return !listHas(g_cfgShowTo, exe);
@@ -1412,7 +1436,7 @@ namespace {
 namespace {
     PLUGIN_DESCRIPTION_INFO initImpl(HANDLE handle) {
         g_handle = handle;
-        const PLUGIN_DESCRIPTION_INFO info{"noshare-cover", "image or video instead of the no_screen_share black box", "gitscout-bot", "2.0.9"};
+        const PLUGIN_DESCRIPTION_INFO info{"noshare-cover", "image or video instead of the no_screen_share black box", "gitscout-bot", NSC_VERSION};
 
         // A plugin built against other headers reads wrong field offsets and
         // crashes the compositor. Bail out right away: Hyprland catches the exception,

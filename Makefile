@@ -49,6 +49,9 @@ HELPER_SRC := vaapi-helper/Cargo.toml $(shell find vaapi-helper/src vendor -name
 # No ffmpeg/cairo/libjpeg/giflib: all media handling lives in the Rust core.
 PKGS     := hyprland pixman-1 libdrm wayland-server egl hyprutils hyprgraphics aquamarine hyprlang
 CXXFLAGS := -std=c++26 -shared -fPIC -fno-gnu-unique -O2 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers
+# the version Hyprland shows in `hyprctl plugin list` comes from Cargo.toml, so it can't drift
+VERSION  := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+CXXFLAGS += -DNSC_VERSION='"$(VERSION)"'
 INCLUDES := $(shell pkg-config --cflags $(PKGS)) -Iinclude
 # Rust std on Linux: pthread, dl, m. VA-API/dav1d/openh264 come with the decoders.
 LIBS     := -lpthread -ldl -lm
@@ -71,7 +74,7 @@ $(RUST_LIB): $(RUST_SRC)
 	$(CARGO) build --release --locked -p noshare-cover --no-default-features --features nvdec,cpu-av1,cpu-h264,cpu-vpx
 endif
 
-lib$(PLUGIN).so: shim/plugin.cpp include/noshare_cover.h include/noshare_cover_api.h $(RUST_LIB)
+lib$(PLUGIN).so: shim/plugin.cpp include/noshare_cover.h include/noshare_cover_api.h Cargo.toml $(RUST_LIB)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) shim/plugin.cpp $(RUST_LIB) -o $@ $(LDFLAGS) $(LIBS)
 
 test:
