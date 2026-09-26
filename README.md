@@ -114,6 +114,19 @@ clients (here, only from portal streams) and a client that can't be identified i
 covered. Names are separated by commas or spaces. With both lists empty the plugin never
 looks the client up.
 
+The same lists work per window or layer rule, and then only the rule's own lists apply to
+that surface:
+
+```lua
+hl.window_rule({ match = { class = "org.telegram.desktop" }, no_screen_share = true,
+    no_screen_share_show_to = "grim" })               -- screenshots see it, streams don't
+hl.layer_rule({ match = { namespace = "waybar" }, no_screen_share = true,
+    no_screen_share_hide_from = "xdg-desktop-portal-hyprland" })
+```
+
+A hidden background layer (e.g. the wallpaper) is covered over its whole area, including the
+windows on top of it, the same as Hyprland's own black box.
+
 Cursor zoom (`cursor:zoom_factor`) is handled too: the stream gets the zoomed image, while
 Hyprland places its own `no_screen_share` boxes as if there were no zoom, so they miss the
 windows. While the monitor is zoomed the plugin draws all the boxes itself where the windows
