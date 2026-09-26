@@ -36,6 +36,10 @@
 #include <string>
 #include <thread>
 #include <unistd.h>
+
+#ifndef NSC_VERSION // set by the Makefile from Cargo.toml
+#define NSC_VERSION "unknown"
+#endif
 #include <unordered_map>
 #include <unordered_set>
 #include <variant>
@@ -1250,6 +1254,7 @@ namespace {
         if (!byHideList && !hasEntries(g_cfgShowTo))
             return true; // no lists: the old behaviour, no /proc lookups per frame
         const auto exe = captureClientExe(frame);
+        NSC_TRACE("capture client: %s\n", exe.empty() ? "(unknown)" : exe.c_str());
         if (byHideList)
             return exe.empty() || listHas(g_cfgHideFrom, exe); // unknown client: hide, to be safe
         return !listHas(g_cfgShowTo, exe);
@@ -1412,7 +1417,7 @@ namespace {
 namespace {
     PLUGIN_DESCRIPTION_INFO initImpl(HANDLE handle) {
         g_handle = handle;
-        const PLUGIN_DESCRIPTION_INFO info{"noshare-cover", "image or video instead of the no_screen_share black box", "gitscout-bot", "2.0.9"};
+        const PLUGIN_DESCRIPTION_INFO info{"noshare-cover", "image or video instead of the no_screen_share black box", "gitscout-bot", NSC_VERSION};
 
         // A plugin built against other headers reads wrong field offsets and
         // crashes the compositor. Bail out right away: Hyprland catches the exception,
