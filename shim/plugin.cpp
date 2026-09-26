@@ -1062,7 +1062,10 @@ namespace {
             std::iota(order.begin(), order.end(), size_t{0});
             std::ranges::stable_sort(order, {}, [&](size_t k) { return visible[k].geo.floating; });
             for (const size_t j : order) {
-                if (visible[j].geo.opaque)
+                // Never redraw a hidden window from its real content. This also catches
+                // windows that are only translucent for a moment (fading in on open).
+                const auto& wj = visible[j].w;
+                if (visible[j].geo.opaque || !wj->m_ruleApplicator || wj->m_ruleApplicator->noScreenShare().valueOrDefault())
                     continue;
                 CRegion region;
                 for (const auto& [i, clip] : drawn)
@@ -1277,7 +1280,7 @@ namespace {
 namespace {
     PLUGIN_DESCRIPTION_INFO initImpl(HANDLE handle) {
         g_handle = handle;
-        const PLUGIN_DESCRIPTION_INFO info{"noshare-cover", "image or video instead of the no_screen_share black box", "gitscout-bot", "2.0.7"};
+        const PLUGIN_DESCRIPTION_INFO info{"noshare-cover", "image or video instead of the no_screen_share black box", "gitscout-bot", "2.0.8"};
 
         // A plugin built against other headers reads wrong field offsets and
         // crashes the compositor. Bail out right away: Hyprland catches the exception,
