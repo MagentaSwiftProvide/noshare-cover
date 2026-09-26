@@ -26,6 +26,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <ranges>
 #include <set>
@@ -39,6 +40,7 @@
 #include <variant>
 #include <vector>
 
+#include "config/ConfigValue.hpp"
 #include "config/values/ConfigValues.hpp"
 #include "desktop/rule/Engine.hpp"
 #include "desktop/rule/layerRule/LayerRule.hpp"
@@ -160,6 +162,15 @@ namespace {
         return w->presentation().alphaValue(Desktop::View::WINDOW_ALPHA_FADE) * w->presentation().alphaValue(Desktop::View::WINDOW_ALPHA_FULLSCREEN);
 #else
         return w->alphaValue(Desktop::View::WINDOW_ALPHA_FADE) * w->alphaValue(Desktop::View::WINDOW_ALPHA_FULLSCREEN);
+#endif
+    }
+
+    // everything that makes the window translucent as a whole: fade, fullscreen, opacity rules
+    float windowAlpha(const PHLWINDOW& w) {
+#ifdef NSC_SPLIT_WINDOW
+        return windowFade(w) * w->presentation().alphaValue(Desktop::View::WINDOW_ALPHA_ACTIVE);
+#else
+        return windowFade(w) * w->alphaValue(Desktop::View::WINDOW_ALPHA_ACTIVE);
 #endif
     }
 
@@ -883,6 +894,47 @@ namespace {
         region.subtract(CBox{b.x, b.y + r, b.w, b.h - 2 * r});
     }
 
+    // Draw a window again from its surface textures, with its alpha, rounding and blur,
+    // limited to clip. Used for translucent windows above a hidden one: the cover went
+    // over them, and this puts them back on top of it.
+    void redrawWindow(const PHLWINDOW& w, const SWinGeo& geo, const CRegion& clip, const PHLMONITOR& mon, const Vector2D& capturePos) {
+        const auto res = w->resource();
+        if (!res)
+            return;
+        Vector2D base = geo.pos;
+        if (!windowIsX11(w)) {
+            const auto client = windowClientGeometryPos(w);
+            if (!client)
+                return;
+            base -= *client;
+        }
+        static auto PBLUR = CConfigValue<Config::INTEGER>("decoration:blur:enabled");
+        const bool  blur  = *PBLUR && !(w->m_ruleApplicator && w->m_ruleApplicator->noBlur().valueOrDefault());
+        const float alpha = windowAlpha(w);
+        res->breadthfirst(
+            [&](SP<CWLSurfaceResource> surf, const Vector2D& local, void*) {
+                const auto tex = surf->m_current.texture;
+                if (!tex)
+                    return;
+                const bool main = surf == res;
+                const auto box  = zoomed(mon, CBox{base + local, surf->m_current.size}.translate(-mon->m_position).scale(mon->m_scale)).translate(-capturePos);
+                if (box.w < 1 || box.h < 1)
+                    return;
+                g_pHyprRenderer->draw(
+                    CTexPassElement::SRenderData{
+                        .tex                   = tex,
+                        .box                   = box,
+                        .a                     = alpha,
+                        .round                 = main ? geo.round : 0,
+                        .roundingPower         = geo.roundingPower,
+                        .blur                  = main && blur,
+                        .blockBlurOptimization = true, // blur what is really under it (the cover), not the cached wallpaper
+                    },
+                    clip);
+            },
+            nullptr);
+    }
+
     // ownBoxes: Hyprland's black boxes were suppressed for this frame (see
     // suppressNoScreenShare), so everything without a cover is drawn black here.
     void paintCovers(Screenshare::CScreenshareFrame* frame, bool ownBoxes) {
@@ -918,19 +970,23 @@ namespace {
             if (w)
                 if (const auto g = windowGeo(w, mon, capturePos))
                     visible.push_back({w, *g});
+        // o is stacked above me
+        const auto isAbove = [&](size_t o, size_t me) {
+            const auto& a = visible[o].geo;
+            const auto& b = visible[me].geo;
+            return o != me && ((a.floating && !b.floating) || (a.floating == b.floating && o > me));
+        };
         const auto visibleRegion = [&](size_t i) {
-            const auto& me = visible[i].geo;
-            CRegion     region{me.box};
-            for (size_t j = 0; j < visible.size(); ++j) {
-                const auto& o     = visible[j].geo;
-                const bool  above = (o.floating && !me.floating) || (o.floating == me.floating && j > i);
-                // Only opaque windows hide what is below them. Under a translucent one the
-                // hidden window would show through, so the cover stays there.
-                if (j != i && above && o.opaque)
-                    subtractRounded(region, o.box, o.round);
-            }
+            CRegion region{visible[i].geo.box};
+            // Only opaque windows hide what is below them. Under a translucent one the
+            // hidden window would show through, so the cover goes there too and the
+            // translucent window is drawn again on top of it (see below).
+            for (size_t j = 0; j < visible.size(); ++j)
+                if (isAbove(j, i) && visible[j].geo.opaque)
+                    subtractRounded(region, visible[j].geo.box, visible[j].geo.round);
             return region;
         };
+        std::vector<std::pair<size_t, CRegion>> drawn; // covers (or black) drawn, per window
 
         std::unordered_set<uintptr_t> seen;
         for (size_t i = 0; i < visible.size(); ++i) {
@@ -978,19 +1034,54 @@ namespace {
             nsc_frame f{};
             if (!nsc_resolve(&req, &f)) {
                 NSC_TRACE("window %s: no cover frame yet\n", windowClass(w).c_str());
-                if (ownBoxes)
+                if (ownBoxes) {
                     drawBlack(box, round, roundingPower, clip);
+                    drawn.emplace_back(i, clip);
+                }
                 continue;
             }
             const auto tex = textureFor(f);
             if (!tex) {
                 NSC_TRACE("window %s: texture failed (%ux%u)\n", windowClass(w).c_str(), f.width, f.height);
-                if (ownBoxes)
+                if (ownBoxes) {
                     drawBlack(box, round, roundingPower, clip);
+                    drawn.emplace_back(i, clip);
+                }
                 continue;
             }
             NSC_TRACE("window %s: cover %ux%u at %.0f,%.0f %.0fx%.0f\n", windowClass(w).c_str(), f.width, f.height, box.x, box.y, box.w, box.h);
             g_pHyprRenderer->draw(CTexPassElement::SRenderData{.tex = tex, .box = box, .round = round, .roundingPower = roundingPower}, clip);
+            drawn.emplace_back(i, clip);
+        }
+
+        // Translucent windows above a hidden one, bottom to top: draw them again over the
+        // cover, so what shows through them (blurred, if they blur) is the cover and never
+        // the hidden window. Only over covers below them, minus whatever is above them.
+        if (!drawn.empty()) {
+            std::vector<size_t> order(visible.size());
+            std::iota(order.begin(), order.end(), size_t{0});
+            std::ranges::stable_sort(order, {}, [&](size_t k) { return visible[k].geo.floating; });
+            for (const size_t j : order) {
+                if (visible[j].geo.opaque)
+                    continue;
+                CRegion region;
+                for (const auto& [i, clip] : drawn)
+                    if (isAbove(j, i))
+                        region.add(clip);
+                if (region.empty())
+                    continue;
+                region.intersect(CRegion{visible[j].geo.box});
+                for (size_t k = 0; k < visible.size(); ++k)
+                    if (isAbove(k, j) && visible[k].geo.opaque)
+                        subtractRounded(region, visible[k].geo.box, visible[k].geo.round);
+                for (const auto& [i, clip] : drawn)
+                    if (isAbove(i, j))
+                        region.subtract(clip);
+                if (region.empty())
+                    continue;
+                NSC_TRACE("window %s: redrawn over a cover\n", windowClass(visible[j].w).c_str());
+                redrawWindow(visible[j].w, visible[j].geo, region, mon, capturePos);
+            }
         }
 
 
@@ -1186,7 +1277,7 @@ namespace {
 namespace {
     PLUGIN_DESCRIPTION_INFO initImpl(HANDLE handle) {
         g_handle = handle;
-        const PLUGIN_DESCRIPTION_INFO info{"noshare-cover", "image or video instead of the no_screen_share black box", "gitscout-bot", "2.0.6"};
+        const PLUGIN_DESCRIPTION_INFO info{"noshare-cover", "image or video instead of the no_screen_share black box", "gitscout-bot", "2.0.7"};
 
         // A plugin built against other headers reads wrong field offsets and
         // crashes the compositor. Bail out right away: Hyprland catches the exception,

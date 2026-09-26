@@ -19,7 +19,7 @@ fail() { printf '  \e[31mFAIL\e[0m %s\n' "$*"; FAILS=$((FAILS + 1)); }
 
 magick -size 640x360 xc:'#ff00ff' "$WORK/cover.png"
 
-write_config() { # $1: close_hold ms, $2: close animation speed (ds, 0 = off), $3: zoom factor
+write_config() { # $1: close_hold ms, $2: close animation speed (ds, 0 = off), $3: zoom factor, $4: blur (true/false)
     local anim="animations = { enabled = false },"
     [ "$2" != 0 ] && anim="animations = { enabled = true },"
     cat > "$WORK/hypr.lua" <<LUA
@@ -28,7 +28,7 @@ hl.plugin.load("$PLUGIN")
 hl.config({
     plugin = { no_screen_share_cover = { path_cover = "$WORK/cover.png", close_hold = $1 } },
     general = { gaps_in = 0, gaps_out = 0, border_size = 0, layout = "dwindle" },
-    decoration = { rounding = 0, shadow = { enabled = false }, blur = { enabled = false } },
+    decoration = { rounding = 0, shadow = { enabled = false }, blur = { enabled = ${4:-false} } },
     cursor = { zoom_factor = $3 },
     $anim
     misc = { disable_hyprland_logo = true, disable_splash_rendering = true },
@@ -142,18 +142,28 @@ if [ "$px" -gt 60 ]; then
     C=$(mean_rgb overlap "40x$((ph / 2))+$((px - 50))+$((py + ph / 4))")
     is_cover "$C" && pass "hidden window around it is still covered ($C)" || fail "hidden window not covered next to the floating one ($C)"
 fi
-# a translucent window on top: the hidden one would show through it, so the cover stays
-kill "$(win_pid plain)"; sleep 0.5
-foot --app-id glass -o colors-dark.alpha=0.6 sh -c 'while :; do date; sleep 0.2; done' >/dev/null 2>&1 &
-for _ in $(seq 40); do sleep 0.25; [ -n "$(win_box glass)" ] && break; done
-sleep 1
-hctl dispatch 'hl.dsp.window.float({ action = "toggle" })' >/dev/null
-hctl dispatch 'hl.dsp.window.resize({ x = 400, y = 300 })' >/dev/null
-hctl dispatch 'hl.dsp.window.move({ x = 120, y = 250 })' >/dev/null
-sleep 1
-shot glass
-C=$(mean_rgb glass "$(inner "$(win_box glass)" 60)")
-is_cover "$C" && pass "translucent window on top: nothing shows through ($C)" || fail "hidden window shows through a translucent one ($C)"
+# A translucent window on top: what shows through it must be the cover (tinted by the
+# window's own background), never the hidden window, and the window itself stays drawn.
+# The hidden foot is dark gray: showing through, it would give ~36 36 36.
+shows_cover_through() { read -r r g b <<<"$1"; [ "$r" -gt 70 ] && [ "$b" -gt 70 ] && [ "$g" -lt 70 ] && [ "$r" -lt 230 ]; }
+glass_case() { # $1 label, $2 blur true/false
+    write_config 0 0 1 "$2"
+    start_hyprland
+    open_win cover-me
+    foot --app-id glass -o colors-dark.alpha=0.6 sh -c 'while :; do date; sleep 0.2; done' >/dev/null 2>&1 &
+    for _ in $(seq 40); do sleep 0.25; [ -n "$(win_box glass)" ] && break; done
+    sleep 1
+    hctl dispatch 'hl.dsp.window.float({ action = "toggle" })' >/dev/null
+    hctl dispatch 'hl.dsp.window.resize({ x = 400, y = 300 })' >/dev/null
+    hctl dispatch 'hl.dsp.window.move({ x = 120, y = 250 })' >/dev/null
+    sleep 1
+    shot "glass-$2"
+    local c; c=$(mean_rgb "glass-$2" "$(inner "$(win_box glass)" 60)")
+    shows_cover_through "$c" && pass "$1: the cover shows through it ($c)" || fail "$1: expected the cover through the window, got $c"
+}
+kill "$(win_pid plain)"
+glass_case "translucent window on top" false
+glass_case "translucent window with blur on top" true
 
 echo "== cursor zoom"
 write_config 0 0 2

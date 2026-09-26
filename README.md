@@ -89,8 +89,9 @@ The field names of the original plugin (`["no_screen_share_cover:path_cover"]`,
 Without `no_screen_share` the window is not covered. If several rules match, the last value wins.
 
 A window placed on top of a hidden one stays visible in the stream: the cover (or the black box)
-is drawn only where the hidden window actually shows. Translucent windows on top are the
-exception, the hidden window would show through them, so the cover stays over them.
+is drawn only where the hidden window actually shows. Under a translucent window on top the
+cover is drawn too and the window is drawn again over it, with its own opacity and blur, so what
+shows through it is the cover, never the hidden window.
 
 When a window or layer closes, Hyprland replaces it with a snapshot for the close animation,
 and `no_screen_share` does not apply to that snapshot, so without the plugin its content
