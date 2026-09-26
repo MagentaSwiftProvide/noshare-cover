@@ -35,6 +35,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <variant>
@@ -236,6 +237,8 @@ namespace {
     SP<Config::Values::CStringValue> g_cfgBackend;
     SP<Config::Values::CStringValue> g_cfgGpu;
     SP<Config::Values::CIntValue>    g_cfgCloseHold;
+    SP<Config::Values::CStringValue> g_cfgShowTo;
+    SP<Config::Values::CStringValue> g_cfgHideFrom;
 
     using EffectId = Desktop::Rule::CWindowRuleEffectContainer::storageType;
 
@@ -1190,11 +1193,86 @@ namespace {
         drainNotifications();
     }
 
+    // Executable name of the capture client behind this frame: the portal for
+    // PipeWire streams (browsers, Discord), or wf-recorder, grim, obs (wlrobs)...
+    // when they capture directly. Empty if it can't be found out.
+    std::string captureClientExe(Screenshare::CScreenshareFrame* frame) {
+        // the session is owned by a unique pointer in the manager: its weak pointer can't be
+        // lock()ed (hyprutils asserts), only checked and read
+        if (!frame || frame->m_session.expired())
+            return {};
+        const auto* session = frame->m_session.get();
+        if (!session || !session->m_client)
+            return {};
+        pid_t pid = 0;
+        uid_t uid = 0;
+        gid_t gid = 0;
+        wl_client_get_credentials(session->m_client, &pid, &uid, &gid);
+        if (pid <= 0)
+            return {};
+        char       buf[4096];
+        const auto n = readlink(std::format("/proc/{}/exe", pid).c_str(), buf, sizeof(buf) - 1);
+        if (n <= 0)
+            return {};
+        std::string exe(buf, n);
+        if (exe.ends_with(" (deleted)")) // the binary was updated while running
+            exe.resize(exe.size() - 10);
+        const auto slash = exe.rfind('/');
+        return slash == std::string::npos ? exe : exe.substr(slash + 1);
+    }
+
+    // "grim, obs  wf-recorder" -> contains(exe)
+    bool listHas(const SP<Config::Values::CStringValue>& cfg, const std::string& exe) {
+        if (!cfg || exe.empty())
+            return false;
+        const std::string list = cfg->value();
+        size_t            i    = 0;
+        while (i < list.size()) {
+            const auto start = list.find_first_not_of(", \t", i);
+            if (start == std::string::npos)
+                break;
+            const auto end = list.find_first_of(", \t", start);
+            if (list.compare(start, end == std::string::npos ? std::string::npos : end - start, exe) == 0)
+                return true;
+            i = end;
+        }
+        return false;
+    }
+
+    bool hasEntries(const SP<Config::Values::CStringValue>& cfg) {
+        return cfg && cfg->value().find_first_not_of(", \t") != std::string::npos;
+    }
+
+    // Hidden windows are hidden from every capture by default. show_to lets chosen
+    // clients see them (own screenshots); hide_from, if set, hides only from its list.
+    bool hideFrom(Screenshare::CScreenshareFrame* frame) {
+        const bool byHideList = hasEntries(g_cfgHideFrom);
+        if (!byHideList && !hasEntries(g_cfgShowTo))
+            return true; // no lists: the old behaviour, no /proc lookups per frame
+        const auto exe = captureClientExe(frame);
+        if (byHideList)
+            return exe.empty() || listHas(g_cfgHideFrom, exe); // unknown client: hide, to be safe
+        return !listHas(g_cfgShowTo, exe);
+    }
+
     using RenderMonitorFn = void (*)(Screenshare::CScreenshareFrame*);
 
     void hkRenderMonitor(Screenshare::CScreenshareFrame* self) {
         NSC_TRACE("hook: renderMonitor\n");
         const auto original = reinterpret_cast<RenderMonitorFn>(g_hook->m_original);
+        if (!hideFrom(self)) {
+            // a client allowed to see: the frame as it is, no covers and no Hyprland boxes
+            NSC_TRACE("capture client allowed to see hidden windows\n");
+            const auto suppressed = suppressNoScreenShare();
+            try {
+                original(self);
+            } catch (...) {
+                restoreNoScreenShare(suppressed);
+                throw;
+            }
+            restoreNoScreenShare(suppressed);
+            return;
+        }
         // Hyprland's boxes are always switched off and drawn by us: under zoom they land
         // in the wrong place, and they are drawn over everything, including windows that
         // sit on top of a hidden one.
@@ -1325,6 +1403,8 @@ namespace {
         g_cfgBackend.reset();
         g_cfgGpu.reset();
         g_cfgCloseHold.reset();
+        g_cfgShowTo.reset();
+        g_cfgHideFrom.reset();
         g_handle = nullptr;
     }
 } // namespace
@@ -1361,6 +1441,10 @@ namespace {
         g_cfgGpu     = makeValue<Config::Values::CStringValue>("plugin:no_screen_share_cover:gpu_device", "Render node for GPU decode, empty = first one", Config::STRING{});
         g_cfgCloseHold = makeValue<Config::Values::CIntValue>("plugin:no_screen_share_cover:close_hold", "Keep the cover this many ms after a closed window's animation ends",
                                                               Config::INTEGER{0});
+        g_cfgShowTo   = makeValue<Config::Values::CStringValue>("plugin:no_screen_share_cover:show_to",
+                                                                "Capture clients (exe names) that see hidden windows as they are, e.g. \"grim, obs\"", Config::STRING{});
+        g_cfgHideFrom = makeValue<Config::Values::CStringValue>("plugin:no_screen_share_cover:hide_from",
+                                                                "If set, hide only from these capture clients (exe names); everyone else sees everything", Config::STRING{});
 
         void* target = nullptr;
         for (const auto& match : HyprlandAPI::findFunctionsByName(handle, "renderMonitor")) {
