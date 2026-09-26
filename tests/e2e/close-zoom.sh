@@ -6,7 +6,7 @@
 #
 #   tests/e2e/close-zoom.sh <libnoshare-cover.so>
 #
-# Same requirements as run.sh, plus wf-recorder. Exit code 0 means all passed.
+# Same requirements as run.sh, plus wf-recorder and slurp. Exit code 0 means all passed.
 set -uo pipefail
 
 PLUGIN=$(realpath "${1:?path to libnoshare-cover.so}")
@@ -173,6 +173,47 @@ kill "$(win_pid plain)"
 glass_case "translucent window on top" false
 glass_case "translucent window with blur on top" true
 glass_case "hidden translucent window over a hidden one" true cover-me
+
+# A blurred translucent window half over a hidden window and half over a normal one:
+# the redraw (with blur) must stay on the hidden half. The normal window shows black
+# text on white; if the blur spilled over, that half would turn into flat gray.
+write_config 0 0 1 true
+start_hyprland
+open_win cover-me
+foot --app-id plain -o colors-dark.background=ffffff -o colors-dark.foreground=000000 sh -c 'while :; do seq 1 3000 | tr "
+" " "; sleep 5; done' >/dev/null 2>&1 &
+for _ in $(seq 40); do sleep 0.25; [ -n "$(win_box plain)" ] && break; done
+foot --app-id glass -o colors-dark.alpha=0.4 sh -c 'while :; do date; sleep 0.2; done' >/dev/null 2>&1 &
+for _ in $(seq 40); do sleep 0.25; [ -n "$(win_box glass)" ] && break; done
+sleep 1
+hctl dispatch 'hl.dsp.window.float({ action = "toggle" })' >/dev/null
+hctl dispatch 'hl.dsp.window.resize({ x = 600, y = 400 })' >/dev/null
+hctl dispatch 'hl.dsp.window.move({ x = 340, y = 200 })' >/dev/null
+sleep 1.5
+shot straddle
+# right part of the glass window (x 700..900), over the normal window
+SD=$(magick "$WORK/straddle.png" -crop 200x250+700+300 -colorspace gray -format '%[fx:standard_deviation]' info:)
+awk "BEGIN{exit !($SD > 0.08)}" && pass "blur stays on the hidden half, the normal window keeps its text (stddev $SD)" || fail "blur spilled over the normal window (stddev $SD)"
+C=$(mean_rgb straddle "200x250+400+300")
+shows_cover_through "$C" && pass "the hidden half shows the cover through the glass ($C)" || fail "hidden half: expected the cover through the glass, got $C"
+
+# A layer on top of a hidden window (bar, launcher, notification) must stay visible:
+# slurp puts a 50% black overlay layer over the whole screen.
+if command -v slurp >/dev/null; then
+    write_config 0 0 1
+    start_hyprland
+    open_win cover-me
+    slurp -b '#00000080' >/dev/null 2>&1 &
+    SL=$!
+    sleep 1.5
+    shot layer-on-top
+    kill $SL 2>/dev/null
+    C=$(mean_rgb layer-on-top "$(inner "$(win_box cover-me)" 50)")
+    read -r r g b <<<"$C"
+    [ "$r" -gt 90 ] && [ "$r" -lt 170 ] && [ "$b" -gt 90 ] && [ "$b" -lt 170 ] && [ "$g" -lt 40 ]         && pass "overlay layer on top of a hidden window stays visible ($C)" || fail "overlay layer hidden under the cover ($C)"
+else
+    echo "  (no slurp, skipping the layer case)"
+fi
 
 echo "== cursor zoom"
 write_config 0 0 2

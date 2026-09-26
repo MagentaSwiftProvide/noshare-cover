@@ -728,7 +728,9 @@ namespace {
         startClosing(true, reinterpret_cast<uintptr_t>(l.get()), l->m_monitor.lock(), CBox{pos, size}, ruleValuesFor(l), 0.F, 2.F);
     }
 
-    void paintClosing(const PHLMONITOR& mon, const Vector2D& capturePos, std::chrono::steady_clock::time_point now) {
+    // Returns the area it drew over (capture pixels).
+    CRegion paintClosing(const PHLMONITOR& mon, const Vector2D& capturePos, std::chrono::steady_clock::time_point now) {
+        CRegion drawnArea;
         for (auto& c : g_closing) {
             if (c.mon.lock() != mon)
                 continue;
@@ -762,7 +764,30 @@ namespace {
                 g_pHyprRenderer->draw(CTexPassElement::SRenderData{.tex = tex, .box = box, .round = round, .roundingPower = c.roundingPower}, box);
             else
                 drawBlack(box, round, c.roundingPower); // no cover set: at least hide it like no_screen_share would
+            drawnArea.add(box);
         }
+        return drawnArea;
+    }
+
+    // Draw a layer again from its surface textures with its alpha, limited to clip.
+    void redrawLayer(const PHLLS& l, const CRegion& clip, const PHLMONITOR& mon, const Vector2D& capturePos) {
+        const auto res = l->resource();
+        if (!res)
+            return;
+        float alpha = 1.F;
+        for (uint8_t k = 0; k < Desktop::View::LS_ALPHA_LAST; ++k)
+            alpha *= l->alpha().get(k)->value();
+        const auto base = l->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
+        res->breadthfirst(
+            [&](SP<CWLSurfaceResource> surf, const Vector2D& local, void*) {
+                const auto tex = surf->m_current.texture;
+                if (!tex)
+                    return;
+                const auto box = zoomed(mon, CBox{base + local, surf->m_current.size}.translate(-mon->m_position).scale(mon->m_scale)).translate(-capturePos);
+                if (box.w >= 1 && box.h >= 1)
+                    g_pHyprRenderer->draw(CTexPassElement::SRenderData{.tex = tex, .box = box, .a = alpha, .clipRegion = clip}, clip);
+            },
+            nullptr);
     }
 
     void paintExtraRects(const PHLMONITOR& mon, const Vector2D& capturePos) {
@@ -929,6 +954,9 @@ namespace {
                         .roundingPower         = geo.roundingPower,
                         .blur                  = main && blur,
                         .blockBlurOptimization = true, // blur what is really under it (the cover), not the cached wallpaper
+                        // the damage clip alone isn't enough: the blur pass draws the blurred
+                        // background over the whole box unless clipRegion is set
+                        .clipRegion = clip,
                     },
                     clip);
             },
@@ -1128,7 +1156,31 @@ namespace {
         }
 
         trackClosed(mon, seen, now);
-        paintClosing(mon, capturePos, now);
+        CRegion coverArea = paintClosing(mon, capturePos, now);
+
+        // Layers above windows (bars, launchers, notifications) are drawn by Hyprland on
+        // top of the hidden window, and the covers went over them. Draw them again on top,
+        // only where a window cover was drawn, top then overlay. Hidden layers never.
+        for (const auto& [i, clip] : drawn)
+            coverArea.add(clip);
+        if (!coverArea.empty()) {
+            for (const uint32_t level : {2U, 3U}) {
+                for (const auto& l : Desktop::layerState()->layers()) {
+                    if (!l || l->m_layer != level || !viewVisible(l) || l->m_monitor.lock() != mon)
+                        continue;
+                    if (!l->m_ruleApplicator || l->m_ruleApplicator->noScreenShare().valueOrDefault())
+                        continue;
+                    const auto pos  = l->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
+                    const auto size = l->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
+                    CRegion    region{zoomed(mon, CBox{pos, size}.translate(-mon->m_position).scale(mon->m_scale)).translate(-capturePos)};
+                    region.intersect(coverArea);
+                    if (region.empty())
+                        continue;
+                    NSC_TRACE("layer %s: redrawn over a cover\n", l->m_namespace.c_str());
+                    redrawLayer(l, region, mon, capturePos);
+                }
+            }
+        }
 
         paintExtraRects(mon, capturePos);
         nsc_end_frame();
@@ -1280,7 +1332,7 @@ namespace {
 namespace {
     PLUGIN_DESCRIPTION_INFO initImpl(HANDLE handle) {
         g_handle = handle;
-        const PLUGIN_DESCRIPTION_INFO info{"noshare-cover", "image or video instead of the no_screen_share black box", "gitscout-bot", "2.0.8"};
+        const PLUGIN_DESCRIPTION_INFO info{"noshare-cover", "image or video instead of the no_screen_share black box", "gitscout-bot", "2.0.9"};
 
         // A plugin built against other headers reads wrong field offsets and
         // crashes the compositor. Bail out right away: Hyprland catches the exception,
