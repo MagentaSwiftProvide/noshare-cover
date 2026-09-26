@@ -104,6 +104,12 @@ flashes in the stream. The cover follows the snapshot until the animation ends, 
 `close_hold` ms (per window or layer rule: `no_screen_share_cover_hold`). `0` covers just the
 animation.
 
+The same hold applies when a window stops being hidden while it stays on screen, e.g. a rule
+that matches the title stops matching. A browser changes the window title before it repaints,
+so when you switch away from a matching tab the old page would otherwise reach the stream for
+a frame or two; set `no_screen_share_cover_hold` (e.g. 300) on such a rule. Clients listed in
+`show_to` get no hold.
+
 By default hidden windows are covered in every capture: portal streams (browsers, Discord,
 OBS via PipeWire) and clients that capture the screen directly (grim, wf-recorder,
 gpu-screen-recorder, OBS with wlrobs). The capture client is told apart by its executable
