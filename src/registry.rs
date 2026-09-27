@@ -74,11 +74,26 @@ impl Loader {
     }
 }
 
+impl Loader {
+    /// The thread is done (result sent, or it never started): dropping the
+    /// loader now doesn't wait.
+    fn finished(&self) -> bool {
+        self.worker.as_ref().is_none_or(|w| w.is_finished())
+    }
+
+    /// Nobody needs the result any more. Stops the first-frame wait; the open
+    /// itself (decoding a whole GIF, setting up a decoder) can't be interrupted,
+    /// so the registry parks the loader instead of dropping it on the render path.
+    fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
 impl Drop for Loader {
     fn drop(&mut self) {
-        // The thread must be gone before the plugin can be unloaded. Cancel
-        // stops the first-frame wait; the open itself is short.
-        self.cancel.store(true, Ordering::Relaxed);
+        // The thread must be gone before the plugin can be unloaded. The registry
+        // only drops loaders that are finished, or on its own drop (unload).
+        self.cancel();
         if let Some(w) = self.worker.take() {
             let _ = w.join();
         }
@@ -135,6 +150,11 @@ pub struct Registry {
     frame_no: u64,
     notifier: Notifier,
     opener: Opener,
+    /// Loaders of covers dropped while still opening (settings change, eviction).
+    /// Joining them right there could stall the render hook for as long as the
+    /// open takes, so they are parked here and reaped once finished. What is left
+    /// is joined when the registry itself goes away, on unload.
+    retired: Vec<Loader>,
 }
 
 impl Default for Registry {
@@ -153,6 +173,18 @@ impl Registry {
             frame_no: 0,
             notifier: Notifier::default(),
             opener,
+            retired: Vec::new(),
+        }
+    }
+
+    /// Park the loader of a cover that is going away (see `retired`).
+    fn retire(&mut self, cover: Cover) {
+        // a finished loader is simply dropped with the cover: joining it is instant
+        if let State::Opening { loader, .. } = cover.state
+            && !loader.finished()
+        {
+            loader.cancel();
+            self.retired.push(loader);
         }
     }
 
@@ -173,7 +205,10 @@ impl Registry {
         if self.settings.as_ref() == Some(&settings) {
             return;
         }
-        self.covers.clear(); // dropping sources stops the video threads
+        // dropping sources stops the video threads; covers still opening are parked
+        for (_, cover) in std::mem::take(&mut self.covers) {
+            self.retire(cover);
+        }
         self.settings = Some(settings);
         self.epoch += 1;
         self.notifier.reset();
@@ -196,6 +231,8 @@ impl Registry {
 
     pub fn begin_frame(&mut self) {
         self.frame_no += 1;
+        // joining a finished thread is instant
+        self.retired.retain(|l| !l.finished());
     }
 
     /// Cover for a window. `None` means nothing to draw (no file, error, no frame yet).
@@ -321,9 +358,19 @@ impl Registry {
     /// End of frame: close covers nobody has shown for a while.
     pub fn end_frame(&mut self, now: Instant) {
         let default = self.settings().default_play();
-        self.covers.retain(|play, c| {
-            *play == default || now.saturating_duration_since(c.last_used) < EVICT_AFTER
-        });
+        let stale: Vec<PlayParams> = self
+            .covers
+            .iter()
+            .filter(|(play, c)| {
+                **play != default && now.saturating_duration_since(c.last_used) >= EVICT_AFTER
+            })
+            .map(|(play, _)| play.clone())
+            .collect();
+        for play in stale {
+            if let Some(cover) = self.covers.remove(&play) {
+                self.retire(cover);
+            }
+        }
     }
 
     /// Whether any live animated cover (video, GIF) exists. The shim uses this
@@ -520,11 +567,7 @@ mod tests {
         let p = play("/warm");
         r.warm(&p, Instant::now());
         r.warm(&p, Instant::now());
-        let end = Instant::now() + Duration::from_secs(5);
-        while opens("/warm") == 0 && Instant::now() < end {
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        std::thread::sleep(Duration::from_millis(20));
+        assert!(loaded(&r, &p), "loader finished");
         assert_eq!(opens("/warm"), 1, "warming twice opens once");
         r.begin_frame();
         assert!(
@@ -533,12 +576,35 @@ mod tests {
         );
     }
 
+    /// Wait until the cover's loader thread is done (its result is ready to be
+    /// picked up by the next resolve), with a timeout instead of a fixed sleep.
+    fn loaded(r: &Registry, p: &PlayParams) -> bool {
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
+            let done = match r.covers.get(p).map(|c| &c.state) {
+                Some(State::Opening { loader, .. }) => loader.finished(),
+                Some(_) => true,
+                None => false,
+            };
+            if done || Instant::now() > end {
+                return done;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     #[test]
-    fn dropping_an_opening_cover_joins_the_loader() {
+    fn dropping_an_opening_cover_does_not_block() {
         let mut r = reg();
+        assert!(
+            loaded(&r, &play("/default")),
+            "default cover out of the way"
+        );
         r.begin_frame();
         assert!(r.resolve(&play("/slow"), Instant::now()).is_none());
-        // settings change drops every cover, including the one being opened
+        // a settings change drops every cover, including the one being opened
+        // (the slow opener takes 150 ms): that must not wait for it
+        let t = Instant::now();
         r.set_settings(
             Settings {
                 speed: 3.0,
@@ -546,7 +612,55 @@ mod tests {
             },
             None,
         );
-        drop(r);
+        assert!(
+            t.elapsed() < Duration::from_millis(50),
+            "set_settings took {:?}",
+            t.elapsed()
+        );
+        assert_eq!(r.retired.len(), 1, "the loader is parked");
+
+        // eviction the same way
+        r.begin_frame();
+        let now = Instant::now();
+        assert!(r.resolve(&play("/slow"), now).is_none());
+        let t = Instant::now();
+        r.end_frame(now + EVICT_AFTER * 2);
+        assert!(t.elapsed() < Duration::from_millis(50));
+        assert_eq!(r.retired.len(), 2);
+
+        // finished loaders are reaped at the start of a frame
+        let end = Instant::now() + Duration::from_secs(5);
+        while !r.retired.iter().all(Loader::finished) && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        r.begin_frame();
+        assert!(r.retired.is_empty());
+    }
+
+    #[test]
+    fn unload_joins_parked_loaders() {
+        let mut r = reg();
+        assert!(
+            loaded(&r, &play("/default")),
+            "default cover out of the way"
+        );
+        r.begin_frame();
+        assert!(r.resolve(&play("/slow"), Instant::now()).is_none());
+        r.set_settings(
+            Settings {
+                speed: 4.0,
+                ..defaults()
+            },
+            None,
+        );
+        assert_eq!(r.retired.len(), 1);
+        let t = Instant::now();
+        drop(r); // plugin unload: the parked loader is joined, not leaked
+        assert!(
+            t.elapsed() >= Duration::from_millis(50),
+            "drop waited for the loader ({:?})",
+            t.elapsed()
+        );
     }
 
     #[test]
